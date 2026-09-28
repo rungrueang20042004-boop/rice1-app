@@ -28,7 +28,15 @@ st.set_page_config(
 
 # ตั้ง path ของไฟล์ฐานข้อมูลผ่าน environment variable ได้ (ชี้ไปยังดิสก์ถาวรเมื่อ deploy)
 DB_FILE = os.environ.get("RICE_DB_PATH", "rice_records.db")
-RAIN_LIMIT = 60  # % โอกาสฝนที่ถือว่าไม่เหมาะกับการพ่นยา
+# เกณฑ์ % ฝนที่ถือว่าไม่เหมาะกับการพ่นยา (เทียบกับค่าที่ได้จากแหล่งพยากรณ์โดยตรง)
+# หมายเหตุ: ค่า PercentRainCover ของกรมอุตุฯ คือสัดส่วนพื้นที่ที่คาดว่ามีฝน ไม่ใช่โอกาสฝน ณ จุดใดจุดหนึ่ง
+# หากเกณฑ์ 60 เข้มหรือหลวมเกินไปสำหรับข้อมูลชุดนี้ ให้ปรับตรงนี้
+RAIN_LIMIT = 60
+
+# แหล่งพยากรณ์อากาศ: "tmd" = กรมอุตุนิยมวิทยา (ค่าเริ่มต้น) หรือ "openmeteo"
+WEATHER_SOURCE = os.environ.get("WEATHER_SOURCE", "tmd").strip().lower()
+TMD_URL = "https://data.tmd.go.th/api/WeatherForecast7Days/v2/"
+TMD_PROVINCE = "ฉะเชิงเทรา"  # API ของกรมอุตุฯ เป็นระดับจังหวัด (ล่วงหน้า 7 วัน)
 
 
 def _st_version():
@@ -73,6 +81,15 @@ def fmt_days(n):
     return f"+{n} วัน" if n > 0 else f"{n} วัน"
 
 
+def get_secret(name):
+    """อ่านค่าลับจาก st.secrets ก่อน แล้วค่อยดูจาก environment variable"""
+    try:
+        value = st.secrets.get(name)
+    except Exception:
+        value = None
+    return value or os.environ.get(name)
+
+
 def require_login():
     """ถ้าตั้งค่า APP_PASSWORD ใน .streamlit/secrets.toml จะบังคับให้ใส่รหัสผ่านก่อนใช้งาน"""
     try:
@@ -111,55 +128,61 @@ district_coords = {
     "คลองเขื่อน": {"lat": 13.792, "lon": 101.162},
 }
 
-# หมายเหตุ: ควรตรวจการจัดหมวดเบา/หนักกับข้อมูลกรมการข้าวอีกครั้ง
-# และอาจย้ายไปเป็นไฟล์ CSV/JSON แยก เพื่อให้เจ้าหน้าที่แก้ไขได้โดยไม่ต้องแตะโค้ด
-rice_catalog = {
-    'กข1 (RD1)': 'พันธุ์หนัก', 'กข3 (RD3)': 'พันธุ์หนัก', 'กข5 (RD5)': 'พันธุ์หนัก',
-    'กข7 (RD7)': 'พันธุ์หนัก', 'กข9 (RD9)': 'พันธุ์หนัก', 'กข11 (RD11)': 'พันธุ์หนัก',
-    'กข13 (RD13)': 'พันธุ์หนัก', 'กข15 (RD15)': 'พันธุ์หนัก', 'กข17 (RD17)': 'พันธุ์หนัก',
-    'กข19 (RD19)': 'พันธุ์หนัก', 'กข21 (RD21)': 'พันธุ์เบา', 'กข23 (RD23)': 'พันธุ์เบา',
-    'กข25 (RD25)': 'พันธุ์หนัก', 'กข27 (RD27)': 'พันธุ์เบา', 'กข29 (ชัยนาท 80)': 'พันธุ์เบา',
-    'กข31 (ปทุมธานี 80)': 'พันธุ์เบา', 'กข33 (หอมอุบล 80)': 'พันธุ์เบา', 'กข35 (RD35)': 'พันธุ์เบา',
-    'กข37 (RD37)': 'พันธุ์เบา', 'กข39 (RD39)': 'พันธุ์หนัก', 'กข41 (RD41)': 'พันธุ์เบา',
-    'กข43 (RD43)': 'พันธุ์เบา', 'กข45 (RD45)': 'พันธุ์เบา', 'กข47 (RD47)': 'พันธุ์เบา',
-    'กข49 (RD49)': 'พันธุ์เบา', 'กข51 (RD51)': 'พันธุ์เบา', 'กข53 (RD53)': 'พันธุ์เบา',
-    'กข55 (RD55)': 'พันธุ์เบา', 'กข57 (RD57)': 'พันธุ์เบา', 'กข59 (RD59)': 'พันธุ์เบา',
-    'กข61 (RD61)': 'พันธุ์เบา', 'กข63 (RD63)': 'พันธุ์เบา', 'กข65 (RD65)': 'พันธุ์เบา',
-    'กข67 (RD67)': 'พันธุ์เบา', 'กข69 (RD69)': 'พันธุ์เบา', 'กข71 (RD71)': 'พันธุ์เบา',
-    'กข73 (RD73)': 'พันธุ์เบา', 'กข75 (RD75)': 'พันธุ์เบา', 'กข77 (RD77)': 'พันธุ์เบา',
-    'กข79 (RD79)': 'พันธุ์หนัก', 'กข81 (RD81)': 'พันธุ์เบา', 'กข83 (RD83)': 'พันธุ์หนัก',
-    'กข85 (RD85)': 'พันธุ์หนัก', 'กข87 (RD87)': 'พันธุ์เบา', 'กข89 (RD89)': 'พันธุ์เบา',
-    'กข91 (RD91)': 'พันธุ์เบา', 'กข93 (RD93)': 'พันธุ์เบา', 'กข95 (RD95)': 'พันธุ์เบา',
-    'กข97 (RD97)': 'พันธุ์เบา', 'กข99 (RD99)': 'พันธุ์เบา', 'กข101 (RD101)': 'พันธุ์เบา',
-    'กข103 (RD103)': 'พันธุ์เบา', 'กข105 (RD105)': 'พันธุ์เบา', 'กข107 (RD107)': 'พันธุ์เบา',
-    'ขาวดอกมะลิ 105 (KDML 105)': 'พันธุ์หนัก', 'ปทุมธานี 1': 'พันธุ์เบา', 'สุพรรณบุรี 1': 'พันธุ์หนัก',
-    'สุพรรณบุรี 2': 'พันธุ์เบา', 'สุพรรณบุรี 3': 'พันธุ์เบา', 'สุพรรณบุรี 60': 'พันธุ์หนัก',
-    'สุพรรณบุรี 90': 'พันธุ์หนัก', 'ชัยนาท 1': 'พันธุ์หนัก', 'ชัยนาท 2': 'พันธุ์เบา',
-    'พิษณุโลก 1': 'พันธุ์หนัก', 'พิษณุโลก 2': 'พันธุ์หนัก', 'พิษณุโลก 60-1': 'พันธุ์หนัก',
-    'พิษณุโลก 80': 'พันธุ์เบา', 'พัทลุง 60': 'พันธุ์หนัก', 'ปราจีนบุรี 1': 'พันธุ์หนัก',
-    'ปราจีนบุรี 2': 'พันธุ์หนัก', 'ชุมแพ 60': 'พันธุ์หนัก', 'เชียงใหม่ 60': 'พันธุ์หนัก',
-    'แก่นจันทร์': 'พันธุ์หนัก', 'คลองหลวง 1': 'พันธุ์เบา', 'หอมสุพรรณบุรี': 'พันธุ์หนัก',
-    'หอมคลองหลวง 1': 'พันธุ์เบา', 'หอมปทุม': 'พันธุ์เบา', 'หอมจันท์': 'พันธุ์หนัก',
-    'หอมนางแก้ว': 'พันธุ์หนัก', 'หอมชลสิทธิ์': 'พันธุ์หนัก', 'หอมมาลี': 'พันธุ์หนัก',
-    'ขาวตาแห้ง 17': 'พันธุ์หนัก', 'ขาวปากหม้อ 148': 'พันธุ์หนัก', 'นางพญา 132': 'พันธุ์หนัก',
-    'พลายงาม พธ.60': 'พันธุ์หนัก', 'เหนียวกระทัง 148': 'พันธุ์หนัก', 'ตะเภาแก้ว 161': 'พันธุ์หนัก',
-    'เจ๊กเชย 1 เสาไห้': 'พันธุ์หนัก', 'ปิ่นแก้ว 56': 'พันธุ์หนัก', 'สังข์หยดพัทลุง': 'พันธุ์หนัก',
-    'เล็บนกปัตตานี': 'พันธุ์หนัก', 'เฉี้ยงพัทลุง': 'พันธุ์หนัก', 'พวงไร่ 2': 'พันธุ์หนัก',
-    'พวงเงินพวงทอง': 'พันธุ์หนัก', 'อัลฮัมดุลิลลาฮ์ 4': 'พันธุ์หนัก', 'เจ้าฮ่อ': 'พันธุ์หนัก',
-    'ทับทิมชุมพร': 'พันธุ์เบา', 'ไรซ์เบอร์รี่': 'พันธุ์หนัก', 'หอมดอย': 'พันธุ์หนัก',
-    'บือโป๊ะโละ': 'พันธุ์หนัก', 'เจ้าลอย': 'พันธุ์หนัก', 'แดงดอ': 'พันธุ์เบา',
-    'ก้องกลาง': 'พันธุ์เบา', 'เหลืองทอง': 'พันธุ์หนัก', 'ข้าวเจ้าหอมมะลิทุ่งกุลา': 'พันธุ์หนัก',
-    'เบอร์ 5451': 'พันธุ์เบา'
-}
+# รายชื่อพันธุ์ข้าวอยู่ในไฟล์ CSV (ตามเกณฑ์การจัดหมวดเบา/หนักของบริษัท) แก้ไขด้วย Excel ได้โดยไม่ต้องแตะโค้ด
+# คอลัมน์: ชื่อพันธุ์ | ประเภท (พันธุ์เบา หรือ พันธุ์หนัก) | ไวแสง (ใส่ "ใช่" ถ้าเป็นพันธุ์ไวแสง ไม่ใช่เว้นว่าง)
+# ตั้ง path อื่นได้ผ่าน environment variable RICE_CATALOG_PATH
+try:
+    BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+except NameError:
+    BASE_DIR = os.getcwd()
+CATALOG_FILE = os.environ.get(
+    "RICE_CATALOG_PATH", os.path.join(BASE_DIR, "data", "rice_catalog.csv")
+)
+VALID_RICE_TYPES = ("พันธุ์เบา", "พันธุ์หนัก")
+TRUE_VALUES = {"ใช่", "1", "y", "yes", "true", "x"}
 
-# พันธุ์ไวต่อช่วงแสง: ออกดอกตามความยาวของวัน ไม่ใช่ตามจำนวนวันหลังหว่าน
-# (รายการนี้เป็นเพียงตัวอย่างเริ่มต้น ควรให้นักวิชาการตรวจและเพิ่มเติม)
-PHOTOPERIOD_SENSITIVE = {
-    "ขาวดอกมะลิ 105 (KDML 105)",
-    "กข15 (RD15)",
-    "ขาวตาแห้ง 17",
-    "ข้าวเจ้าหอมมะลิทุ่งกุลา",
-}
+
+def load_rice_catalog(path):
+    """อ่านและตรวจไฟล์รายชื่อพันธุ์ข้าว คืนค่า (dict ชื่อ -> ประเภท, set ของพันธุ์ไวแสง)"""
+    if not os.path.exists(path):
+        st.error(f"❌ ไม่พบไฟล์รายชื่อพันธุ์ข้าว: {path}")
+        st.stop()
+    try:
+        df = pd.read_csv(path, encoding="utf-8-sig", dtype=str, keep_default_na=False)
+    except Exception as exc:
+        st.error(f"❌ อ่านไฟล์รายชื่อพันธุ์ข้าวไม่สำเร็จ: {exc}")
+        st.stop()
+    missing_cols = {"ชื่อพันธุ์", "ประเภท"} - set(df.columns)
+    if missing_cols:
+        st.error(f"❌ ไฟล์รายชื่อพันธุ์ข้าวขาดคอลัมน์: {', '.join(sorted(missing_cols))}")
+        st.stop()
+
+    df["ชื่อพันธุ์"] = df["ชื่อพันธุ์"].str.strip()
+    df["ประเภท"] = df["ประเภท"].str.strip()
+    df = df[df["ชื่อพันธุ์"] != ""]
+
+    bad_type = df[~df["ประเภท"].isin(VALID_RICE_TYPES)]
+    if not bad_type.empty:
+        st.error(
+            "❌ ประเภทพันธุ์ไม่ถูกต้อง (ต้องเป็น 'พันธุ์เบา' หรือ 'พันธุ์หนัก'): "
+            + ", ".join(bad_type["ชื่อพันธุ์"])
+        )
+        st.stop()
+    duplicated = df[df["ชื่อพันธุ์"].duplicated()]
+    if not duplicated.empty:
+        st.error("❌ ชื่อพันธุ์ซ้ำในไฟล์: " + ", ".join(duplicated["ชื่อพันธุ์"]))
+        st.stop()
+
+    catalog = dict(zip(df["ชื่อพันธุ์"], df["ประเภท"]))
+    photoperiod = set()
+    if "ไวแสง" in df.columns:
+        flags = df["ไวแสง"].str.strip().str.lower().isin(TRUE_VALUES)
+        photoperiod = set(df.loc[flags, "ชื่อพันธุ์"])
+    return catalog, photoperiod
+
+
+# PHOTOPERIOD_SENSITIVE: พันธุ์ไวต่อช่วงแสง ออกดอกตามความยาวของวัน ไม่ใช่ตามจำนวนวันหลังหว่าน
+rice_catalog, PHOTOPERIOD_SENSITIVE = load_rice_catalog(CATALOG_FILE)
 
 planting_methods = ["หว่านน้ำตม", "หว่านแห้ง / หว่านสำรวย", "ปักดำ / ดำนา"]
 TRANSPLANT_METHOD = "ปักดำ / ดำนา"
@@ -453,9 +476,49 @@ def load_db():
 # ---------------------------------------------------------
 # 3. พยากรณ์อากาศ และการคำนวณปฏิทินกิจกรรม
 # ---------------------------------------------------------
+def _tmd_date(text):
+    """แปลงวันที่ dd/mm/yyyy (รองรับปี พ.ศ.) เป็น 'YYYY-MM-DD'"""
+    d, m, y = [int(x) for x in str(text).strip().split("/")]
+    if y > 2400:
+        y -= 543
+    return datetime.date(y, m, d).strftime("%Y-%m-%d")
+
+
+def parse_tmd_forecast(data, province=TMD_PROVINCE):
+    """
+    แปลงผลตอบกลับของ WeatherForecast7Days (v2, json) เป็น {'YYYY-MM-DD': % ฝนปกคลุมพื้นที่}
+    รองรับทั้งกรณี Province เป็น list (หลายจังหวัด) และ dict (จังหวัดเดียว)
+    """
+    provinces = data["Provinces"]["Province"]
+    if isinstance(provinces, dict):
+        provinces = [provinces]
+    match = next(
+        (p for p in provinces if str(p.get("ProvinceNameThai", "")).strip() == province), None
+    )
+    if match is None:
+        raise ValueError(f"ไม่พบจังหวัด {province} ในข้อมูลของกรมอุตุฯ")
+    forecast = match["SevenDaysForecast"]
+    return {
+        _tmd_date(d): int(float(r))
+        for d, r in zip(forecast["ForecastDate"], forecast["PercentRainCover"])
+    }
+
+
 @st.cache_data(ttl=3600, show_spinner=False)
-def _fetch_weather(lat, lon):
+def _fetch_tmd(uid, ukey, province):
     # ถ้าเรียก API ไม่สำเร็จจะ raise เพื่อไม่ให้ผลว่างถูกแคชไว้ 1 ชั่วโมง
+    res = requests.get(
+        TMD_URL,
+        params={"uid": uid, "ukey": ukey, "format": "json", "Province": province},
+        headers={"Accept": "application/json"},
+        timeout=10,
+    )
+    res.raise_for_status()
+    return parse_tmd_forecast(res.json(), province)
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def _fetch_openmeteo(lat, lon):
     res = requests.get(
         "https://api.open-meteo.com/v1/forecast",
         params={
@@ -473,11 +536,28 @@ def _fetch_weather(lat, lon):
 
 
 def fetch_district_weather(district_name):
-    coords = district_coords.get(district_name, district_coords["เมืองฉะเชิงเทรา"])
+    """
+    คืน {วันที่: % ฝน} ถ้าดึงไม่ได้คืน {} (ระบบใช้สถิติรายเดือนแทน)
+    และเก็บสาเหตุไว้แสดงท้ายหน้า (ไม่ใส่ URL เพื่อไม่ให้รหัส API หลุดขึ้นหน้าจอ)
+    """
     try:
-        return _fetch_weather(coords["lat"], coords["lon"])
-    except Exception:
-        return {}
+        if WEATHER_SOURCE == "openmeteo":
+            coords = district_coords.get(district_name, district_coords["เมืองฉะเชิงเทรา"])
+            result = _fetch_openmeteo(coords["lat"], coords["lon"])
+        else:
+            uid, ukey = get_secret("TMD_UID"), get_secret("TMD_UKEY")
+            if not uid or not ukey:
+                raise RuntimeError("ยังไม่ได้ตั้งค่า TMD_UID / TMD_UKEY")
+            result = _fetch_tmd(str(uid), str(ukey), TMD_PROVINCE)
+        st.session_state.pop("_weather_err", None)
+        return result
+    except requests.HTTPError as exc:
+        st.session_state["_weather_err"] = f"HTTP {exc.response.status_code}"
+    except requests.RequestException as exc:
+        st.session_state["_weather_err"] = type(exc).__name__
+    except Exception as exc:
+        st.session_state["_weather_err"] = f"{type(exc).__name__}: {exc}"
+    return {}
 
 
 def format_date_range(d_start, d_end):
@@ -526,6 +606,68 @@ def suggest_dry_day(start, end, forecast, extra_days=5):
     return None
 
 
+def rain_window(start, end, forecast):
+    """โอกาสฝนรายวันตลอดช่วงกิจกรรม [(วันที่, % ฝน, เป็นพยากรณ์สดหรือไม่)] เฉพาะวันที่ยังไม่ผ่านมา"""
+    days = []
+    d = max(start, today())
+    while d <= end:
+        pct, live = rain_for(d, forecast)
+        days.append((d, pct, live))
+        d += timedelta(days=1)
+    return days
+
+
+def describe_rain(days, district_name):
+    pcts = [x[1] for x in days]
+    low, high = min(pcts), max(pcts)
+    span = f"{low}%" if low == high else f"{low}-{high}%"
+    live_count = sum(1 for x in days if x[2])
+    if live_count == len(days):
+        if WEATHER_SOURCE == "openmeteo":
+            return f"⚡ {span} (พยากรณ์สด อ.{district_name})"
+        return f"⚡ {span} (พยากรณ์กรมอุตุฯ จ.{TMD_PROVINCE})"
+    if live_count == 0:
+        return f"📊 {span} (สถิติรายเดือน)"
+    return f"⚡ {span} (มีพยากรณ์ {live_count}/{len(days)} วัน ที่เหลือใช้สถิติ)"
+
+
+def assess_rain(rule, days, n_start, n_end, forecast, district_name):
+    """
+    ประเมินฝนตลอดช่วงกิจกรรม คืน (ข้อความสถานะ, คำแนะนำ, ต้องเตือนสีแดงหรือไม่)
+    - ไม่ใช่กิจกรรมพ่นยา: แสดงช่วงโอกาสฝนเฉยๆ
+    - พ่นยา + ฝนมากทุกวันในช่วง: เตือนแดง และแนะนำวันแห้งที่ใกล้ที่สุด
+    - พ่นยา + ฝนมากบางวัน: ไม่เตือนแดง แต่แนะนำวันที่ฝนน้อยที่สุดในช่วง
+    """
+    if not days:
+        return "⏳ ช่วงกิจกรรมนี้ผ่านมาแล้ว", "-", False
+    status = describe_rain(days, district_name)
+    if not rule["is_spray"]:
+        return status, "-", False
+
+    rainy = [x for x in days if x[1] > RAIN_LIMIT]
+    if not rainy:
+        return status, "-", False
+
+    if len(rainy) == len(days):
+        status += " ⚠️ ฝนมากตลอดช่วง"
+        if any(x[2] for x in days):
+            found = suggest_dry_day(n_start, n_end, forecast)
+            if found:
+                advice = f"💡 แนะนำทำวันที่ {found[0].strftime('%d/%m')} (ฝน {found[1]}%)"
+            else:
+                advice = "💡 ฝนสูงต่อเนื่อง ควรติดตามพยากรณ์ก่อนพ่นยา"
+        else:
+            advice = "💡 ช่วงนี้ฝนชุก ควรติดตามพยากรณ์ใกล้วันทำงาน"
+        return status, advice, True
+
+    dry = [x for x in days if x[1] <= RAIN_LIMIT]
+    best = min(dry, key=lambda x: (x[1], not x[2]))  # ฝนน้อยสุด ถ้าเท่ากันเลือกวันที่มีพยากรณ์สด
+    source = "" if best[2] else " สถิติ"
+    status += " (บางวันฝนมาก)"
+    advice = f"💡 ทำได้ในช่วงนี้ แนะนำวันที่ {best[0].strftime('%d/%m')} (ฝน {best[1]}%{source})"
+    return status, advice, False
+
+
 SCHEDULE_COLS = [
     "กิจกรรม", "วันตามกำหนดเดิม", "วันที่ปรับใหม่",
     "การปรับเปลี่ยน", "โอกาสเกิดฝนและการประเมิน", "คำแนะนำ",
@@ -537,7 +679,7 @@ def get_rice_schedule(sow_date, rice_name, district_name="เมืองฉะ�
     """
     สร้างตารางกิจกรรม
     - วันที่ปรับใหม่: อิงเฉพาะเหตุการณ์การเลื่อนที่ 'บันทึกไว้' เท่านั้น (ไม่เปลี่ยนตามพยากรณ์รายวัน)
-    - ฝนสูงในวันพ่นยา: แสดงเป็น 'คำแนะนำ' ไม่เลื่อนกำหนดการอัตโนมัติ
+    - ฝน: ประเมินทุกวันในช่วงกิจกรรม แสดงเป็น 'คำแนะนำ' ไม่เลื่อนกำหนดการอัตโนมัติ
     - extra_event: (activity, days) สำหรับพรีวิวก่อนบันทึก
     """
     rules = activity_rules[rice_catalog.get(rice_name, "พันธุ์เบา")]
@@ -546,7 +688,6 @@ def get_rice_schedule(sow_date, rice_name, district_name="เมืองฉะ�
         evs.append(extra_event)
     shifts, origins = compute_shifts(rules, evs)
     forecast = fetch_district_weather(district_name)
-    t = today()
     rows = []
 
     for i, rule in enumerate(rules):
@@ -555,30 +696,15 @@ def get_rice_schedule(sow_date, rice_name, district_name="เมืองฉะ�
         o_end = sow_date + timedelta(days=rule["end"])
         n_start = o_start + timedelta(days=shift)
         n_end = o_end + timedelta(days=shift)
-        mid = sow_date + timedelta(days=rule["day"] + shift)
 
         note = "ตรงตามกำหนดเดิม"
         if shift != 0:
             note = f"{fmt_days(shift)} (เริ่มเลื่อนที่: {origins[i]})"
 
-        pct, live = rain_for(mid, forecast)
-        if live:
-            status_text = f"⚡ {pct}% (พยากรณ์สด อ.{district_name})"
-        else:
-            status_text = f"📊 {pct}% (สถิติรายเดือน)"
-
-        advice = "-"
-        danger = bool(rule["is_spray"] and pct > RAIN_LIMIT and mid >= t)
-        if danger:
-            status_text += " ⚠️ ฝนมาก"
-            if live:
-                found = suggest_dry_day(n_start, n_end, forecast)
-                if found:
-                    advice = f"💡 แนะนำทำวันที่ {found[0].strftime('%d/%m')} (ฝน {found[1]}%)"
-                else:
-                    advice = "💡 ฝนสูงต่อเนื่อง ควรติดตามพยากรณ์ก่อนพ่นยา"
-            else:
-                advice = "💡 ช่วงนี้ฝนชุก ควรติดตามพยากรณ์ใกล้วันทำงาน"
+        days = rain_window(n_start, n_end, forecast)
+        status_text, advice, danger = assess_rain(
+            rule, days, n_start, n_end, forecast, district_name
+        )
 
         rows.append({
             "กิจกรรม": rule["activity"],
@@ -618,6 +744,17 @@ def calculate_rice_age(sow_date_str):
     if age_days < 0:
         return f"ยังไม่ถึงวันปลูก (อีก {-age_days} วัน)"
     return f"{age_days} วัน"
+
+
+def warn_unknown_species(df):
+    """เตือนเมื่อมีแปลงที่ชื่อสายพันธุ์ไม่อยู่ใน catalog (เช่น ถูกแก้ชื่อในไฟล์ CSV ภายหลัง)"""
+    unknown = sorted(set(df["สายพันธุ์ข้าว"]) - set(rice_catalog))
+    if unknown:
+        st.warning(
+            "⚠️ พบแปลงที่ใช้ชื่อสายพันธุ์ซึ่งไม่อยู่ใน catalog ปัจจุบัน "
+            "(ระบบใช้ตารางพันธุ์เบาแทนชั่วคราว): " + ", ".join(unknown)
+            + " — กรุณาแก้ชื่อในไฟล์ CSV ให้ตรงกัน หรือแก้ข้อมูลแปลงในแท็บ 4"
+        )
 
 
 NEW_OFFICER = "➕ เพิ่มชื่อผู้รับผิดชอบใหม่..."
@@ -839,6 +976,7 @@ with tab3:
             format_func=lambda x: record_options_tab3[x],
             key="tab3_select",
         )
+        warn_unknown_species(history_df)
         t3 = history_df[history_df["id"] == selected_id_tab3].iloc[0]
         sow_d = parse_date(t3["วันที่เริ่มเพาะปลูก"])
         events3 = get_shift_events(selected_id_tab3)
@@ -903,6 +1041,7 @@ with tab4:
         st.info("ℹ️ ปัจจุบันยังไม่มีข้อมูลแปลงนาในฐานข้อมูลส่วนกลาง")
     else:
         history_df["is_alert"] = history_df["มีปัญหา"].fillna(0).astype(int) == 1
+        warn_unknown_species(history_df)
 
         # ตัวกรอง: ผู้รับผิดชอบ + ค้นหาชื่อเกษตรกร/แปลง
         ALL_OFFICERS = "ทั้งหมด (ทุกผู้รับผิดชอบ)"
@@ -1072,6 +1211,8 @@ with tab4:
                     e_district = st.selectbox(
                         "อำเภอ", d_list, index=d_list.index(row["อำเภอ"]) if row["อำเภอ"] in d_list else 0)
                     r_list = list(rice_catalog.keys())
+                    if row["สายพันธุ์ข้าว"] not in r_list:  # คงชื่อเดิมไว้เป็นตัวเลือกแรก ไม่เปลี่ยนโดยไม่ตั้งใจ
+                        r_list = [row["สายพันธุ์ข้าว"]] + r_list
                     e_rice = st.selectbox(
                         "สายพันธุ์ข้าว", r_list,
                         index=r_list.index(row["สายพันธุ์ข้าว"]) if row["สายพันธุ์ข้าว"] in r_list else 0)
@@ -1105,3 +1246,16 @@ with tab4:
                     with open(DB_FILE, "rb") as f:
                         st.download_button("💽 สำรองฐานข้อมูล (.db)", f.read(),
                                            file_name=f"rice_records_backup_{today():%Y%m%d}.db")
+
+# --- สถานะและเครดิตแหล่งข้อมูลพยากรณ์อากาศ ---
+st.divider()
+weather_err = st.session_state.get("_weather_err")
+if weather_err:
+    st.warning(f"⚠️ ดึงพยากรณ์อากาศไม่สำเร็จ ({weather_err}) ระบบจึงใช้สถิติรายเดือนแทน")
+if WEATHER_SOURCE == "openmeteo":
+    st.caption("ข้อมูลพยากรณ์อากาศ: [Open-Meteo.com](https://open-meteo.com/) (สัญญาอนุญาต CC BY 4.0)")
+else:
+    st.caption(
+        "ข้อมูลพยากรณ์อากาศ: กรมอุตุนิยมวิทยา (data.tmd.go.th) ระดับจังหวัด ล่วงหน้า 7 วัน "
+        "ค่าที่ใช้คือสัดส่วนพื้นที่ที่คาดว่ามีฝน (PercentRainCover) เป็นตัวแทนโอกาสฝน"
+    )
