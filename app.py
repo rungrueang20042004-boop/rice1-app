@@ -1,176 +1,101 @@
+import contextlib
 import datetime
-from datetime import timedelta
+import hmac
+import os
+import re
 import sqlite3
+import time
+from datetime import timedelta
+
 import pandas as pd
 import requests
 import streamlit as st
-import time
+
+try:
+    from zoneinfo import ZoneInfo
+    TZ = ZoneInfo("Asia/Bangkok")
+except Exception:  # เช่น Windows ที่ไม่มี tzdata
+    TZ = datetime.timezone(timedelta(hours=7))
 
 # ---------------------------------------------------------
-# 1. การตั้งค่าหน้า Streamlit และฐานข้อมูล SQLite
+# 0. การตั้งค่าทั่วไป
 # ---------------------------------------------------------
 st.set_page_config(
-    page_title="ระบบปฏิทินนาข้าวและแดชบอร์ดวางแผนตรวจแปลง",
+    page_title="ระบบสนับสนุนที่ปรึกษาเกษตร จ.ฉะเชิงเทรา",
     page_icon="🌾",
     layout="wide",
 )
 
-DB_FILE = "rice_records.db"
+# ตั้ง path ของไฟล์ฐานข้อมูลผ่าน environment variable ได้ (ชี้ไปยังดิสก์ถาวรเมื่อ deploy)
+DB_FILE = os.environ.get("RICE_DB_PATH", "rice_records.db")
+RAIN_LIMIT = 60  # % โอกาสฝนที่ถือว่าไม่เหมาะกับการพ่นยา
 
-def get_db_connection():
-    """เชื่อมต่อฐานข้อมูลโดยกำหนด Timeout เพื่อป้องกันปัญหา Database is locked"""
-    return sqlite3.connect(DB_FILE, timeout=10.0)
 
-def init_db():
-    """สร้าง/อัปเดตตารางในฐานข้อมูล SQLite ให้รองรับ field officer_in_charge"""
-    with get_db_connection() as conn:
-        cursor = conn.cursor()
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS rice_records (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                farmer_name TEXT NOT NULL,
-                district TEXT NOT NULL,
-                field_name TEXT NOT NULL,
-                rice_species TEXT NOT NULL,
-                planting_method TEXT NOT NULL,
-                sow_date TEXT NOT NULL,
-                officer_in_charge TEXT DEFAULT 'ไม่ระบุ',
-                created_at TEXT NOT NULL,
-                status TEXT DEFAULT 'ปกติ',
-                accumulated_shift INTEGER DEFAULT 0,
-                last_delayed_activity TEXT DEFAULT 'ไม่มี',
-                updated_at TEXT NOT NULL
-            )
-        """)
+def _st_version():
+    m = re.match(r"(\d+)\.(\d+)", st.__version__)
+    return (int(m.group(1)), int(m.group(2))) if m else (0, 0)
 
-        cursor.execute("PRAGMA table_info(rice_records)")
-        columns = [column[1] for column in cursor.fetchall()]
-        if "officer_in_charge" not in columns:
-            cursor.execute(
-                "ALTER TABLE rice_records ADD COLUMN officer_in_charge TEXT"
-                " DEFAULT 'ไม่ระบุ'"
-            )
-        conn.commit()
 
-init_db()
+# Streamlit รุ่นใหม่ใช้ width="stretch" แทน use_container_width=True
+STRETCH = (
+    {"width": "stretch"} if _st_version() >= (1, 50) else {"use_container_width": True}
+)
 
-def save_to_db(farmer, district, field, rice, method, date_start, officer):
-    sow_date_str = date_start.strftime("%Y-%m-%d")
-    now_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
-    officer_str = officer.strip() if officer.strip() else "ไม่ระบุ"
 
-    with get_db_connection() as conn:
-        cursor = conn.cursor()
-        cursor.execute(
-            """
-            SELECT id FROM rice_records 
-            WHERE farmer_name = ? AND field_name = ? AND sow_date = ?
-            """,
-            (farmer, field, sow_date_str),
-        )
+def today():
+    """วันที่ปัจจุบันตามเวลาไทย (ไม่ขึ้นกับเขตเวลาของเซิร์ฟเวอร์)"""
+    return datetime.datetime.now(TZ).date()
 
-        if cursor.fetchone() is None:
-            cursor.execute(
-                """
-                INSERT INTO rice_records (
-                    farmer_name, district, field_name, rice_species, planting_method,
-                    sow_date, officer_in_charge, created_at, status, accumulated_shift, last_delayed_activity, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'ปกติ', 0, 'ไม่มี', ?)
-                """,
-                (
-                    farmer, district, field, rice, method, sow_date_str,
-                    officer_str, now_str, now_str,
-                ),
-            )
-            conn.commit()
-            return True
-        return False
 
-def update_field_status_only(record_id, new_status, new_officer=None):
-    now_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
-    with get_db_connection() as conn:
-        cursor = conn.cursor()
-        cursor.execute(
-            "SELECT officer_in_charge FROM rice_records WHERE id = ?",
-            (record_id,),
-        )
-        row = cursor.fetchone()
-        if row:
-            current_officer = row[0] or "ไม่ระบุ"
-            officer_to_save = (
-                new_officer.strip()
-                if new_officer and new_officer.strip()
-                else current_officer
-            )
+def now_str():
+    return datetime.datetime.now(TZ).strftime("%Y-%m-%d %H:%M")
 
-            cursor.execute(
-                """
-                UPDATE rice_records 
-                SET status = ?, officer_in_charge = ?, updated_at = ?
-                WHERE id = ?
-                """,
-                (new_status, officer_to_save, now_str, record_id),
-            )
-            conn.commit()
-            return True
-    return False
 
-def update_field_schedule(record_id, delayed_act_name, extra_shift_days):
-    now_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
-    with get_db_connection() as conn:
-        cursor = conn.cursor()
-        cursor.execute(
-            "SELECT accumulated_shift FROM rice_records WHERE id = ?",
-            (record_id,),
-        )
-        row = cursor.fetchone()
-        if row:
-            current_shift = row[0] or 0
-            new_shift = current_shift + int(extra_shift_days)
+def parse_date(value):
+    try:
+        return datetime.datetime.strptime(str(value), "%Y-%m-%d").date()
+    except Exception:
+        return today()
 
-            cursor.execute(
-                """
-                UPDATE rice_records 
-                SET accumulated_shift = ?, last_delayed_activity = ?, updated_at = ?
-                WHERE id = ?
-                """,
-                (new_shift, delayed_act_name, now_str, record_id),
-            )
-            conn.commit()
-            return True
-    return False
 
-def delete_field_record(record_id):
-    with get_db_connection() as conn:
-        cursor = conn.cursor()
-        cursor.execute("DELETE FROM rice_records WHERE id = ?", (record_id,))
-        conn.commit()
-        return True
+def flash(kind, message):
+    """เก็บข้อความไว้แสดงหลัง st.rerun() (kind: success / warning / error / info)"""
+    st.session_state["_flash"] = (kind, message)
 
-def load_db():
-    with get_db_connection() as conn:
-        query = """
-            SELECT 
-                id,
-                farmer_name AS "ชื่อเกษตรกร",
-                district AS "อำเภอ",
-                field_name AS "ชื่อแปลง/ที่ตั้ง",
-                rice_species AS "สายพันธุ์ข้าว",
-                planting_method AS "วิธีการปลูก",
-                sow_date AS "วันที่เริ่มเพาะปลูก",
-                officer_in_charge AS "ผู้รับผิดชอบแปลง",
-                created_at AS "วันบันทึกข้อมูล",
-                status AS "สถานะ/ปัญหาที่พบ",
-                accumulated_shift AS "จำนวนวันที่ปรับเลื่อนสะสม",
-                last_delayed_activity AS "กิจกรรมล่าสุดที่เลื่อน",
-                updated_at AS "วันที่อัปเดตล่าสุด"
-            FROM rice_records
-        """
-        df = pd.read_sql_query(query, conn)
-        return df
+
+def show_flash():
+    item = st.session_state.pop("_flash", None)
+    if item:
+        getattr(st, item[0])(item[1])
+
+
+def fmt_days(n):
+    return f"+{n} วัน" if n > 0 else f"{n} วัน"
+
+
+def require_login():
+    """ถ้าตั้งค่า APP_PASSWORD ใน .streamlit/secrets.toml จะบังคับให้ใส่รหัสผ่านก่อนใช้งาน"""
+    try:
+        expected = st.secrets.get("APP_PASSWORD")
+    except Exception:
+        expected = None
+    if not expected or st.session_state.get("auth_ok"):
+        return
+    st.title("🔐 เข้าสู่ระบบ")
+    password = st.text_input("รหัสผ่าน", type="password")
+    if st.button("เข้าสู่ระบบ", type="primary"):
+        if hmac.compare_digest(password, str(expected)):
+            st.session_state["auth_ok"] = True
+            st.rerun()
+        else:
+            st.error("รหัสผ่านไม่ถูกต้อง")
+    st.stop()
+
+
+require_login()
 
 # ---------------------------------------------------------
-# 2. ข้อมูลเชิงภูมิศาสตร์ และฐานข้อมูล 123 สายพันธุ์ข้าว (กรมการข้าว)
+# 1. ข้อมูลอ้างอิง: อำเภอ สายพันธุ์ข้าว กฎกิจกรรม
 # ---------------------------------------------------------
 district_coords = {
     "เมืองฉะเชิงเทรา": {"lat": 13.690, "lon": 101.070},
@@ -186,6 +111,8 @@ district_coords = {
     "คลองเขื่อน": {"lat": 13.792, "lon": 101.162},
 }
 
+# หมายเหตุ: ควรตรวจการจัดหมวดเบา/หนักกับข้อมูลกรมการข้าวอีกครั้ง
+# และอาจย้ายไปเป็นไฟล์ CSV/JSON แยก เพื่อให้เจ้าหน้าที่แก้ไขได้โดยไม่ต้องแตะโค้ด
 rice_catalog = {
     'กข1 (RD1)': 'พันธุ์หนัก', 'กข3 (RD3)': 'พันธุ์หนัก', 'กข5 (RD5)': 'พันธุ์หนัก',
     'กข7 (RD7)': 'พันธุ์หนัก', 'กข9 (RD9)': 'พันธุ์หนัก', 'กข11 (RD11)': 'พันธุ์หนัก',
@@ -225,34 +152,44 @@ rice_catalog = {
     'เบอร์ 5451': 'พันธุ์เบา'
 }
 
-planting_methods = ["หว่านน้ำตม"]
+# พันธุ์ไวต่อช่วงแสง: ออกดอกตามความยาวของวัน ไม่ใช่ตามจำนวนวันหลังหว่าน
+# (รายการนี้เป็นเพียงตัวอย่างเริ่มต้น ควรให้นักวิชาการตรวจและเพิ่มเติม)
+PHOTOPERIOD_SENSITIVE = {
+    "ขาวดอกมะลิ 105 (KDML 105)",
+    "กข15 (RD15)",
+    "ขาวตาแห้ง 17",
+    "ข้าวเจ้าหอมมะลิทุ่งกุลา",
+}
+
+planting_methods = ["หว่านน้ำตม", "หว่านแห้ง / หว่านสำรวย", "ปักดำ / ดำนา"]
+TRANSPLANT_METHOD = "ปักดำ / ดำนา"
 
 activity_rules = {
     "พันธุ์เบา": [
-        {"day": 0, "activity": "🌾 วันเริ่มเพาะปลูก/หว่านข้าว", "is_spray": False},
-        {"day": 2, "activity": "💧 ระยะคุมเลน (0-4 วัน)", "is_spray": True},
-        {"day": 9, "activity": "🌿 ระยะคุมฆ่า (7-12 วัน)", "is_spray": True},
-        {"day": 16, "activity": "🌱 หว่านปุ๋ยรอบที่ 1 (15-18 วัน)", "is_spray": False},
-        {"day": 21, "activity": "🐛 พ่นยาหลังปุ๋ยรอบที่ 1 (20-23 วัน)", "is_spray": True},
-        {"day": 32, "activity": "🌾 หว่านปุ๋ยรอบที่ 2 (30-35 วัน)", "is_spray": False},
-        {"day": 35, "activity": "🐛 พ่นยาหลังปุ๋ยรอบที่ 2 (33-38 วัน)", "is_spray": True},
-        {"day": 47, "activity": "🌾 หว่านปุ๋ยรอบที่ 3 (45-50 วัน)", "is_spray": False},
-        {"day": 52, "activity": "🌸 ระยะกัดหางปลาทู (50-55 วัน)", "is_spray": False},
-        {"day": 70, "activity": "🌾 ระยะข้าวก้ม (70 วัน)", "is_spray": False},
-        {"day": 95, "activity": "🚜 วันเก็บเกี่ยวโดยประมาณ", "is_spray": False},
+        {"day": 0, "start": 0, "end": 0, "activity": "🌾 วันเริ่มเพาะปลูก/หว่านข้าว", "is_spray": False},
+        {"day": 2, "start": 0, "end": 4, "activity": "💧 ระยะคุมเลน (0-4 วัน)", "is_spray": True},
+        {"day": 9, "start": 7, "end": 12, "activity": "🌿 ระยะคุมฆ่า (7-12 วัน)", "is_spray": True},
+        {"day": 16, "start": 15, "end": 18, "activity": "🌱 หว่านปุ๋ยรอบที่ 1 (15-18 วัน)", "is_spray": False},
+        {"day": 21, "start": 20, "end": 23, "activity": "🐛 พ่นยาหลังปุ๋ยรอบที่ 1 (20-23 วัน)", "is_spray": True},
+        {"day": 32, "start": 30, "end": 35, "activity": "🌾 หว่านปุ๋ยรอบที่ 2 (30-35 วัน)", "is_spray": False},
+        {"day": 35, "start": 33, "end": 38, "activity": "🐛 พ่นยาหลังปุ๋ยรอบที่ 2 (33-38 วัน)", "is_spray": True},
+        {"day": 47, "start": 45, "end": 50, "activity": "🌾 หว่านปุ๋ยรอบที่ 3 (45-50 วัน)", "is_spray": False},
+        {"day": 52, "start": 50, "end": 55, "activity": "🌸 ระยะกัดหางปลาทู (50-55 วัน)", "is_spray": False},
+        {"day": 70, "start": 70, "end": 70, "activity": "🌾 ระยะข้าวก้ม (70 วัน)", "is_spray": False},
+        {"day": 95, "start": 95, "end": 95, "activity": "🚜 วันเก็บเกี่ยวโดยประมาณ", "is_spray": False},
     ],
     "พันธุ์หนัก": [
-        {"day": 0, "activity": "🌾 วันเริ่มเพาะปลูก/หว่านข้าว", "is_spray": False},
-        {"day": 2, "activity": "💧 ระยะคุมเลน (0-4 วัน)", "is_spray": True},
-        {"day": 9, "activity": "🌿 ระยะคุมฆ่า (7-12 วัน)", "is_spray": True},
-        {"day": 22, "activity": "🌱 หว่านปุ๋ยรอบที่ 1 (20-25 วัน)", "is_spray": False},
-        {"day": 26, "activity": "🐛 พ่นยาหลังปุ๋ยรอบที่ 1 (25-28 วัน)", "is_spray": True},
-        {"day": 47, "activity": "🌾 หว่านปุ๋ยรอบที่ 2 (45-50 วัน)", "is_spray": False},
-        {"day": 50, "activity": "🐛 พ่นยาหลังปุ๋ยรอบที่ 2 (48-53 วัน)", "is_spray": True},
-        {"day": 72, "activity": "🌾 หว่านปุ๋ยรอบที่ 3 (70-75 วัน)", "is_spray": False},
-        {"day": 80, "activity": "🌸 ระยะกัดหางปลาทู (75-85 วัน)", "is_spray": False},
-        {"day": 100, "activity": "🌾 ระยะข้าวก้ม (100 วัน)", "is_spray": False},
-        {"day": 120, "activity": "🚜 วันเก็บเกี่ยวโดยประมาณ", "is_spray": False},
+        {"day": 0, "start": 0, "end": 0, "activity": "🌾 วันเริ่มเพาะปลูก/หว่านข้าว", "is_spray": False},
+        {"day": 2, "start": 0, "end": 4, "activity": "💧 ระยะคุมเลน (0-4 วัน)", "is_spray": True},
+        {"day": 9, "start": 7, "end": 12, "activity": "🌿 ระยะคุมฆ่า (7-12 วัน)", "is_spray": True},
+        {"day": 22, "start": 20, "end": 25, "activity": "🌱 หว่านปุ๋ยรอบที่ 1 (20-25 วัน)", "is_spray": False},
+        {"day": 26, "start": 25, "end": 28, "activity": "🐛 พ่นยาหลังปุ๋ยรอบที่ 1 (25-28 วัน)", "is_spray": True},
+        {"day": 47, "start": 45, "end": 50, "activity": "🌾 หว่านปุ๋ยรอบที่ 2 (45-50 วัน)", "is_spray": False},
+        {"day": 50, "start": 48, "end": 53, "activity": "🐛 พ่นยาหลังปุ๋ยรอบที่ 2 (48-53 วัน)", "is_spray": True},
+        {"day": 72, "start": 70, "end": 75, "activity": "🌾 หว่านปุ๋ยรอบที่ 3 (70-75 วัน)", "is_spray": False},
+        {"day": 80, "start": 75, "end": 85, "activity": "🌸 ระยะกัดหางปลาทู (75-85 วัน)", "is_spray": False},
+        {"day": 100, "start": 100, "end": 100, "activity": "🌾 ระยะข้าวก้ม (100 วัน)", "is_spray": False},
+        {"day": 120, "start": 120, "end": 120, "activity": "🚜 วันเก็บเกี่ยวโดยประมาณ", "is_spray": False},
     ],
 }
 
@@ -262,140 +199,459 @@ chachoengsao_climatology = {
 }
 
 # ---------------------------------------------------------
-# 3. ฟังก์ชันดึงข้อมูลพยากรณ์อากาศ และคำนวณตารางกิจกรรม
+# 2. ฐานข้อมูล SQLite
 # ---------------------------------------------------------
-@st.cache_data(ttl=3600)
-def fetch_district_weather(district_name):
-    coords = district_coords.get(
-        district_name, {"lat": 13.690, "lon": 101.070}
-    )
-    url = f"https://api.open-meteo.com/v1/forecast?latitude={coords['lat']}&longitude={coords['lon']}&daily=precipitation_probability_max&forecast_days=14&timezone=Asia%2FBangkok"
+@contextlib.contextmanager
+def db():
+    """เปิดการเชื่อมต่อ, commit เมื่อสำเร็จ, rollback เมื่อผิดพลาด และปิดการเชื่อมต่อเสมอ"""
+    conn = sqlite3.connect(DB_FILE, timeout=10.0)
     try:
-        res = requests.get(url, timeout=5)
-        res.raise_for_status() # ตรวจสอบ Status Code ป้องกันหน้าเว็บตอบกลับแปลกๆ
-        data = res.json()
-        return {
-            data["daily"]["time"][i]: data["daily"]["precipitation_probability_max"][i]
-            for i in range(len(data["daily"]["time"]))
-        }
+        yield conn
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def init_db():
+    with db() as conn:
+        c = conn.cursor()
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS rice_records (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                farmer_name TEXT NOT NULL,
+                district TEXT NOT NULL,
+                field_name TEXT NOT NULL,
+                rice_species TEXT NOT NULL,
+                planting_method TEXT NOT NULL,
+                sow_date TEXT NOT NULL,
+                officer_in_charge TEXT DEFAULT 'ไม่ระบุ',
+                created_at TEXT NOT NULL,
+                status TEXT DEFAULT 'ปกติ',
+                has_issue INTEGER DEFAULT 0,
+                accumulated_shift INTEGER DEFAULT 0,
+                last_delayed_activity TEXT DEFAULT 'ไม่มี',
+                updated_at TEXT NOT NULL
+            )
+        """)
+        cols = {r[1] for r in c.execute("PRAGMA table_info(rice_records)").fetchall()}
+        if "officer_in_charge" not in cols:
+            c.execute("ALTER TABLE rice_records ADD COLUMN officer_in_charge TEXT DEFAULT 'ไม่ระบุ'")
+        if "has_issue" not in cols:
+            c.execute("ALTER TABLE rice_records ADD COLUMN has_issue INTEGER DEFAULT 0")
+            # ย้ายข้อมูลเดิม: ถือว่ามีปัญหาเมื่อสถานะไม่ใช่ค่าว่าง/'ปกติ' แบบตรงตัว
+            c.execute("""
+                UPDATE rice_records SET has_issue = CASE
+                    WHEN TRIM(COALESCE(status, '')) IN ('', 'ปกติ', 'None') THEN 0
+                    ELSE 1 END
+            """)
+
+        # เหตุการณ์การเลื่อนกิจกรรม (เก็บทุกครั้ง แทนตัวเลขรวมเพียงค่าเดียว)
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS schedule_shifts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                record_id INTEGER NOT NULL,
+                activity TEXT NOT NULL,
+                days INTEGER NOT NULL,
+                created_at TEXT NOT NULL
+            )
+        """)
+        # ประวัติการตรวจแปลง
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS inspections (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                record_id INTEGER NOT NULL,
+                inspected_at TEXT NOT NULL,
+                officer TEXT,
+                activity TEXT,
+                note TEXT,
+                has_issue INTEGER DEFAULT 0
+            )
+        """)
+
+        # ย้ายค่า accumulated_shift แบบเดิมมาเป็นเหตุการณ์ (ทำครั้งเดียว แล้วรีเซ็ตค่าเดิมเป็น 0)
+        first_activity = activity_rules["พันธุ์เบา"][0]["activity"]
+        c.execute("""
+            INSERT INTO schedule_shifts (record_id, activity, days, created_at)
+            SELECT id,
+                   CASE WHEN last_delayed_activity IS NULL
+                             OR last_delayed_activity IN ('', 'ไม่มี')
+                        THEN ? ELSE last_delayed_activity END,
+                   accumulated_shift,
+                   COALESCE(updated_at, created_at)
+            FROM rice_records
+            WHERE accumulated_shift IS NOT NULL AND accumulated_shift <> 0
+        """, (first_activity,))
+        c.execute("UPDATE rice_records SET accumulated_shift = 0 WHERE accumulated_shift <> 0")
+
+
+init_db()
+
+
+def save_to_db(farmer, district, field, rice, method, date_start, officer):
+    sow_date_str = date_start.strftime("%Y-%m-%d")
+    ts = now_str()
+    officer_str = officer.strip() if officer and officer.strip() else "ไม่ระบุ"
+    with db() as conn:
+        exists = conn.execute(
+            "SELECT id FROM rice_records WHERE farmer_name = ? AND field_name = ? AND sow_date = ?",
+            (farmer, field, sow_date_str),
+        ).fetchone()
+        if exists:
+            return False
+        conn.execute(
+            """
+            INSERT INTO rice_records (
+                farmer_name, district, field_name, rice_species, planting_method,
+                sow_date, officer_in_charge, created_at, status, has_issue, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'ปกติ', 0, ?)
+            """,
+            (farmer, district, field, rice, method, sow_date_str, officer_str, ts, ts),
+        )
+        return True
+
+
+def update_record(record_id, farmer, district, field, rice, method, date_start, officer):
+    """แก้ไขข้อมูลพื้นฐานของแปลง คืนค่า 'ok' หรือ 'duplicate'"""
+    sow_date_str = date_start.strftime("%Y-%m-%d")
+    officer_str = officer.strip() if officer and officer.strip() else "ไม่ระบุ"
+    with db() as conn:
+        dup = conn.execute(
+            """SELECT id FROM rice_records
+               WHERE farmer_name = ? AND field_name = ? AND sow_date = ? AND id <> ?""",
+            (farmer, field, sow_date_str, record_id),
+        ).fetchone()
+        if dup:
+            return "duplicate"
+        conn.execute(
+            """UPDATE rice_records
+               SET farmer_name = ?, district = ?, field_name = ?, rice_species = ?,
+                   planting_method = ?, sow_date = ?, officer_in_charge = ?, updated_at = ?
+               WHERE id = ?""",
+            (farmer, district, field, rice, method, sow_date_str, officer_str, now_str(), record_id),
+        )
+        return "ok"
+
+
+def add_inspection(record_id, officer, activity, note, has_issue):
+    """บันทึกประวัติการตรวจ และอัปเดตสถานะล่าสุดของแปลง"""
+    prefix = f"[{activity}] " if activity and not activity.startswith("ไม่ระบุ") else ""
+    text = f"{prefix}{note}".strip()
+    ts = now_str()
+    officer_str = officer.strip() if officer and officer.strip() else "ไม่ระบุ"
+    with db() as conn:
+        conn.execute(
+            """INSERT INTO inspections (record_id, inspected_at, officer, activity, note, has_issue)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            (record_id, ts, officer_str, activity, note, 1 if has_issue else 0),
+        )
+        conn.execute(
+            """UPDATE rice_records
+               SET status = ?, has_issue = ?, officer_in_charge = ?, updated_at = ?
+               WHERE id = ?""",
+            (text if has_issue else "ปกติ", 1 if has_issue else 0, officer_str, ts, record_id),
+        )
+
+
+def get_inspections(record_id, limit=10):
+    with db() as conn:
+        return pd.read_sql_query(
+            """SELECT inspected_at AS "วันที่ตรวจ", officer AS "ผู้ตรวจ",
+                      activity AS "กิจกรรม", note AS "รายละเอียด", has_issue
+               FROM inspections WHERE record_id = ? ORDER BY id DESC LIMIT ?""",
+            conn, params=(record_id, limit),
+        )
+
+
+def add_shift_event(record_id, activity, days):
+    with db() as conn:
+        conn.execute(
+            "INSERT INTO schedule_shifts (record_id, activity, days, created_at) VALUES (?, ?, ?, ?)",
+            (record_id, activity, int(days), now_str()),
+        )
+        conn.execute("UPDATE rice_records SET updated_at = ? WHERE id = ?", (now_str(), record_id))
+
+
+def delete_shift_event(event_id):
+    with db() as conn:
+        conn.execute("DELETE FROM schedule_shifts WHERE id = ?", (event_id,))
+
+
+def get_shift_events(record_id):
+    """คืนรายการ (id, activity, days, created_at) เรียงตามลำดับที่บันทึก"""
+    with db() as conn:
+        return conn.execute(
+            "SELECT id, activity, days, created_at FROM schedule_shifts WHERE record_id = ? ORDER BY id",
+            (record_id,),
+        ).fetchall()
+
+
+def load_shift_events():
+    """คืน dict: record_id -> [(activity, days), ...] สำหรับทุกแปลง"""
+    events = {}
+    with db() as conn:
+        for rid, act, days in conn.execute(
+            "SELECT record_id, activity, days FROM schedule_shifts ORDER BY id"
+        ).fetchall():
+            events.setdefault(rid, []).append((act, days))
+    return events
+
+
+def delete_field_record(record_id):
+    with db() as conn:
+        conn.execute("DELETE FROM schedule_shifts WHERE record_id = ?", (record_id,))
+        conn.execute("DELETE FROM inspections WHERE record_id = ?", (record_id,))
+        conn.execute("DELETE FROM rice_records WHERE id = ?", (record_id,))
+    return True
+
+
+def officer_names():
+    with db() as conn:
+        rows = conn.execute(
+            """SELECT DISTINCT officer_in_charge FROM rice_records
+               WHERE officer_in_charge IS NOT NULL AND TRIM(officer_in_charge) <> ''
+                 AND officer_in_charge <> 'ไม่ระบุ'
+               ORDER BY officer_in_charge"""
+        ).fetchall()
+    return [r[0] for r in rows]
+
+
+def load_db():
+    with db() as conn:
+        query = """
+            SELECT
+                r.id,
+                r.farmer_name AS "ชื่อเกษตรกร",
+                r.district AS "อำเภอ",
+                r.field_name AS "ชื่อแปลง/ที่ตั้ง",
+                r.rice_species AS "สายพันธุ์ข้าว",
+                r.planting_method AS "วิธีการปลูก",
+                r.sow_date AS "วันที่เริ่มเพาะปลูก",
+                r.officer_in_charge AS "ผู้รับผิดชอบแปลง",
+                r.created_at AS "วันบันทึกข้อมูล",
+                r.status AS "สถานะ/ปัญหาที่พบ",
+                r.has_issue AS "มีปัญหา",
+                COALESCE(s.total_days, 0) AS "จำนวนวันที่ปรับเลื่อนสะสม",
+                COALESCE(s.last_act, 'ไม่มี') AS "กิจกรรมล่าสุดที่เลื่อน",
+                r.updated_at AS "วันที่อัปเดตล่าสุด"
+            FROM rice_records r
+            LEFT JOIN (
+                SELECT record_id,
+                       SUM(days) AS total_days,
+                       (SELECT activity FROM schedule_shifts s2
+                         WHERE s2.record_id = s1.record_id ORDER BY s2.id DESC LIMIT 1) AS last_act
+                FROM schedule_shifts s1
+                GROUP BY record_id
+            ) s ON s.record_id = r.id
+            ORDER BY r.id
+        """
+        return pd.read_sql_query(query, conn)
+
+
+# ---------------------------------------------------------
+# 3. พยากรณ์อากาศ และการคำนวณปฏิทินกิจกรรม
+# ---------------------------------------------------------
+@st.cache_data(ttl=3600, show_spinner=False)
+def _fetch_weather(lat, lon):
+    # ถ้าเรียก API ไม่สำเร็จจะ raise เพื่อไม่ให้ผลว่างถูกแคชไว้ 1 ชั่วโมง
+    res = requests.get(
+        "https://api.open-meteo.com/v1/forecast",
+        params={
+            "latitude": lat,
+            "longitude": lon,
+            "daily": "precipitation_probability_max",
+            "forecast_days": 14,
+            "timezone": "Asia/Bangkok",
+        },
+        timeout=5,
+    )
+    res.raise_for_status()
+    data = res.json()
+    return dict(zip(data["daily"]["time"], data["daily"]["precipitation_probability_max"]))
+
+
+def fetch_district_weather(district_name):
+    coords = district_coords.get(district_name, district_coords["เมืองฉะเชิงเทรา"])
+    try:
+        return _fetch_weather(coords["lat"], coords["lon"])
     except Exception:
         return {}
 
-def get_rice_schedule_advanced(
-    sow_date,
-    rice_name,
-    district_name="เมืองฉะเชิงเทรา",
-    base_accum_shift=0,
-    delayed_act_name="ไม่มี",
-    new_delay_days=0,
-):
-    rice_type = rice_catalog.get(rice_name, "พันธุ์เบา")
-    rules = activity_rules[rice_type]
-    weather_forecast = fetch_district_weather(district_name)
-    schedule = []
 
-    all_act_names = [r["activity"] for r in rules]
-    target_idx = (
-        all_act_names.index(delayed_act_name)
-        if delayed_act_name in all_act_names
-        else -1
-    )
+def format_date_range(d_start, d_end):
+    if d_start == d_end:
+        return d_start.strftime("%d/%m/%Y")
+    if d_start.month == d_end.month and d_start.year == d_end.year:
+        return f"{d_start.strftime('%d')}-{d_end.strftime('%d/%m/%Y')}"
+    if d_start.year == d_end.year:
+        return f"{d_start.strftime('%d/%m')}-{d_end.strftime('%d/%m/%Y')}"
+    return f"{d_start.strftime('%d/%m/%Y')}-{d_end.strftime('%d/%m/%Y')}"
 
-    weather_carryover = 0
 
-    for idx, rule in enumerate(rules):
-        original_act_date = sow_date + timedelta(days=rule["day"])
+def compute_shifts(rules, events):
+    """
+    คำนวณจำนวนวันที่เลื่อนของแต่ละกิจกรรมจากรายการเหตุการณ์ [(activity, days), ...]
+    เหตุการณ์หนึ่งครั้งกระทบกิจกรรมที่เลือกและกิจกรรมถัดไปทั้งหมด และเหตุการณ์หลายครั้งรวมกันได้
+    """
+    names = [r["activity"] for r in rules]
+    shifts = [0] * len(rules)
+    origins = [None] * len(rules)
+    for act, days in events:
+        start = names.index(act) if act in names else 0
+        for i in range(start, len(rules)):
+            shifts[i] += days
+            origins[i] = act
+    return shifts, origins
 
-        if target_idx != -1 and idx >= target_idx:
-            active_shift = base_accum_shift + new_delay_days
+
+def rain_for(day, forecast):
+    """คืน (โอกาสฝน %, เป็นพยากรณ์สดหรือไม่)"""
+    key = day.strftime("%Y-%m-%d")
+    if key in forecast:
+        return forecast[key], True
+    return chachoengsao_climatology[day.month], False
+
+
+def suggest_dry_day(start, end, forecast, extra_days=5):
+    """หาวันแรกที่ฝนไม่เกินเกณฑ์ ในช่วงกิจกรรมและอีก extra_days วันถัดไป (เฉพาะวันที่มีพยากรณ์จริง)"""
+    d = max(start, today())
+    last = end + timedelta(days=extra_days)
+    while d <= last:
+        pct = forecast.get(d.strftime("%Y-%m-%d"))
+        if pct is not None and pct <= RAIN_LIMIT:
+            return d, pct
+        d += timedelta(days=1)
+    return None
+
+
+SCHEDULE_COLS = [
+    "กิจกรรม", "วันตามกำหนดเดิม", "วันที่ปรับใหม่",
+    "การปรับเปลี่ยน", "โอกาสเกิดฝนและการประเมิน", "คำแนะนำ",
+]
+
+
+def get_rice_schedule(sow_date, rice_name, district_name="เมืองฉะเชิงเทรา",
+                      events=None, extra_event=None):
+    """
+    สร้างตารางกิจกรรม
+    - วันที่ปรับใหม่: อิงเฉพาะเหตุการณ์การเลื่อนที่ 'บันทึกไว้' เท่านั้น (ไม่เปลี่ยนตามพยากรณ์รายวัน)
+    - ฝนสูงในวันพ่นยา: แสดงเป็น 'คำแนะนำ' ไม่เลื่อนกำหนดการอัตโนมัติ
+    - extra_event: (activity, days) สำหรับพรีวิวก่อนบันทึก
+    """
+    rules = activity_rules[rice_catalog.get(rice_name, "พันธุ์เบา")]
+    evs = list(events or [])
+    if extra_event and extra_event[1]:
+        evs.append(extra_event)
+    shifts, origins = compute_shifts(rules, evs)
+    forecast = fetch_district_weather(district_name)
+    t = today()
+    rows = []
+
+    for i, rule in enumerate(rules):
+        shift = shifts[i]
+        o_start = sow_date + timedelta(days=rule["start"])
+        o_end = sow_date + timedelta(days=rule["end"])
+        n_start = o_start + timedelta(days=shift)
+        n_end = o_end + timedelta(days=shift)
+        mid = sow_date + timedelta(days=rule["day"] + shift)
+
+        note = "ตรงตามกำหนดเดิม"
+        if shift != 0:
+            note = f"{fmt_days(shift)} (เริ่มเลื่อนที่: {origins[i]})"
+
+        pct, live = rain_for(mid, forecast)
+        if live:
+            status_text = f"⚡ {pct}% (พยากรณ์สด อ.{district_name})"
         else:
-            active_shift = 0 if target_idx != -1 else base_accum_shift
+            status_text = f"📊 {pct}% (สถิติรายเดือน)"
 
-        active_shift += weather_carryover
-        is_shifted = active_shift > 0
-
-        act_date = sow_date + timedelta(days=rule["day"] + active_shift)
-        date_str = act_date.strftime("%Y-%m-%d")
-
-        shift_note = (
-            "ตรงตามกำหนดเดิม" if active_shift == 0 else f"+{active_shift} วัน"
-        )
-        if is_shifted and active_shift > 0:
-            shift_note += f" (เริ่มเลื่อนที่: {delayed_act_name if target_idx != -1 else 'ขยับวัน'})"
-
-        if date_str in weather_forecast:
-            rain_chance = weather_forecast[date_str]
-            if rule["is_spray"] and rain_chance > 60:
-                act_date = act_date + timedelta(days=2)
-                active_shift += 2
-                weather_carryover += 2
-                shift_note = f"+{active_shift} วัน (เลื่อนหลบฝน +2 วัน)"
-                status_text = f"⚡ ฝนสด {rain_chance}% ({district_name}) ⚠️ ฝนตกหนัก เลื่อนหลบฝน"
-                schedule.append({
-                    "กิจกรรม": rule["activity"],
-                    "วันตามกำหนดเดิม": original_act_date.strftime("%d/%m/%Y"),
-                    "วันที่ปรับใหม่": act_date.strftime("%d/%m/%Y"),
-                    "การปรับเปลี่ยน": shift_note,
-                    "โอกาสเกิดฝนและการประเมิน": status_text,
-                    "_danger": True,
-                    "_shifted": True,
-                })
-                continue
+        advice = "-"
+        danger = bool(rule["is_spray"] and pct > RAIN_LIMIT and mid >= t)
+        if danger:
+            status_text += " ⚠️ ฝนมาก"
+            if live:
+                found = suggest_dry_day(n_start, n_end, forecast)
+                if found:
+                    advice = f"💡 แนะนำทำวันที่ {found[0].strftime('%d/%m')} (ฝน {found[1]}%)"
+                else:
+                    advice = "💡 ฝนสูงต่อเนื่อง ควรติดตามพยากรณ์ก่อนพ่นยา"
             else:
-                status_text = (
-                    f"⚡ {rain_chance}% [พยากรณ์สด อ.{district_name}]"
-                )
-        else:
-            rain_chance = chachoengsao_climatology[act_date.month]
-            status_text = f"📊 {rain_chance}% (สถิติรายเดือน)"
-            if rule["is_spray"] and rain_chance > 60:
-                status_text += " ⚠️ ช่วงนี้ฝนชุก"
-                schedule.append({
-                    "กิจกรรม": rule["activity"],
-                    "วันตามกำหนดเดิม": original_act_date.strftime("%d/%m/%Y"),
-                    "วันที่ปรับใหม่": act_date.strftime("%d/%m/%Y"),
-                    "การปรับเปลี่ยน": shift_note,
-                    "โอกาสเกิดฝนและการประเมิน": status_text,
-                    "_danger": True,
-                    "_shifted": is_shifted,
-                })
-                continue
+                advice = "💡 ช่วงนี้ฝนชุก ควรติดตามพยากรณ์ใกล้วันทำงาน"
 
-        schedule.append({
+        rows.append({
             "กิจกรรม": rule["activity"],
-            "วันตามกำหนดเดิม": original_act_date.strftime("%d/%m/%Y"),
-            "วันที่ปรับใหม่": act_date.strftime("%d/%m/%Y"),
-            "การปรับเปลี่ยน": shift_note,
+            "วันตามกำหนดเดิม": format_date_range(o_start, o_end),
+            "วันที่ปรับใหม่": format_date_range(n_start, n_end),
+            "การปรับเปลี่ยน": note,
             "โอกาสเกิดฝนและการประเมิน": status_text,
-            "_danger": False,
-            "_shifted": is_shifted,
+            "คำแนะนำ": advice,
+            "_danger": danger,
+            "_shifted": shift != 0,
+            "_start": n_start,
+            "_end": n_end,
         })
-    return pd.DataFrame(schedule)
+    return pd.DataFrame(rows)
 
-def is_alert_status(status_val):
-    status_str = str(status_val).strip()
-    return (
-        status_str != ""
-        and "ปกติ" not in status_str
-        and "None" not in status_str
-        and status_str.lower() != "nan"
-    )
+
+def style_schedule(df):
+    """ไฮไลต์: แดง = ฝนมากในวันพ่นยา, เหลือง = กิจกรรมที่ถูกเลื่อน"""
+    def _highlight(row):
+        if df.loc[row.name, "_danger"]:
+            css = "background-color: #ffebee; font-weight: bold"
+        elif df.loc[row.name, "_shifted"]:
+            css = "background-color: #fff9c4; font-weight: bold"
+        else:
+            css = ""
+        return [css] * len(row)
+
+    return df[SCHEDULE_COLS].style.apply(_highlight, axis=1)
+
 
 def calculate_rice_age(sow_date_str):
     try:
-        sow_date = datetime.datetime.strptime(
-            str(sow_date_str), "%Y-%m-%d"
-        ).date()
-        today = datetime.date.today()
-        age_days = (today - sow_date).days
-        if age_days < 0:
-            return f"ยังไม่ถึงวันปลูก (อีก {-age_days} วัน)"
-        return f"{age_days} วัน"
+        sow = datetime.datetime.strptime(str(sow_date_str), "%Y-%m-%d").date()
     except Exception:
         return "-"
+    age_days = (today() - sow).days
+    if age_days < 0:
+        return f"ยังไม่ถึงวันปลูก (อีก {-age_days} วัน)"
+    return f"{age_days} วัน"
+
+
+NEW_OFFICER = "➕ เพิ่มชื่อผู้รับผิดชอบใหม่..."
+
+
+def officer_input(label, key, current=None):
+    """เลือกผู้รับผิดชอบจากรายชื่อที่มีอยู่ (ลดปัญหาพิมพ์ชื่อไม่ตรงกัน) หรือเพิ่มชื่อใหม่"""
+    options = ["ไม่ระบุ"] + officer_names()
+    if current and current not in options:
+        options.append(current)
+    options.append(NEW_OFFICER)
+    index = options.index(current) if current in options else 0
+    choice = st.selectbox(label, options, index=index, key=f"{key}_sel")
+    if choice == NEW_OFFICER:
+        return st.text_input("ชื่อผู้รับผิดชอบใหม่:", key=f"{key}_new").strip() or "ไม่ระบุ"
+    return choice
+
+
+def rice_warnings(rice_name, method):
+    """แสดงคำเตือนเมื่อตารางมาตรฐานอาจไม่ตรงกับพันธุ์/วิธีปลูกที่เลือก"""
+    if method == TRANSPLANT_METHOD:
+        st.info(
+            "ℹ️ ตารางกิจกรรมนี้อ้างอิงแบบข้าวหว่าน (เช่น คุมเลน/คุมฆ่า) "
+            "สำหรับข้าวปักดำให้ใช้เป็นแนวทางเบื้องต้น และปรับตามคำแนะนำของเจ้าหน้าที่"
+        )
+    if rice_name in PHOTOPERIOD_SENSITIVE:
+        st.info(
+            "ℹ️ พันธุ์นี้ไวต่อช่วงแสง วันออกดอกและเก็บเกี่ยวขึ้นกับช่วงเวลาของปี "
+            "ไม่ได้ขึ้นกับจำนวนวันหลังหว่านเพียงอย่างเดียว ควรใช้วันที่ในตารางช่วงท้ายเป็นค่าประมาณ"
+        )
+
 
 # ---------------------------------------------------------
-# 4. ส่วนเชื่อมต่อผู้ใช้ (User Interface - 4 Tabs)
+# 4. ส่วนติดต่อผู้ใช้ (4 แท็บ)
 # ---------------------------------------------------------
 st.markdown(
     "<h1 style='text-align: center; color: #1e7e34;'>🌾 ระบบสนับสนุนการตัดสินใจและวางแผนตรวจเยี่ยมแปลงนา จ.ฉะเชิงเทรา</h1>",
@@ -405,6 +661,7 @@ st.markdown(
     "<p style='text-align: center; color: #555;'>เครื่องมือส่วนกลางสำหรับเจ้าหน้าที่และที่ปรึกษาทางการเกษตรประจำแผนก</p>",
     unsafe_allow_html=True,
 )
+show_flash()
 
 tab1, tab2, tab3, tab4 = st.tabs([
     "📝 ขึ้นทะเบียนแปลงในความดูแล",
@@ -413,25 +670,20 @@ tab1, tab2, tab3, tab4 = st.tabs([
     "📊 แดชบอร์ดสรุปภาพรวมและจัดการแปลง",
 ])
 
-# --- TAB 1: บันทึกข้อมูลแปลงนา ---
+# --- TAB 1: ขึ้นทะเบียนแปลง ---
 with tab1:
     st.subheader("บันทึกข้อมูลแปลงนาเกษตรกรรายใหม่")
     col1, col2, col3, col4 = st.columns(4)
 
     with col1:
         farmer_name = st.text_input(
-            "👤 ชื่อเกษตรกรผู้รับคำปรึกษา:",
-            placeholder="ตัวอย่าง: นายสมศักดิ์ รักดี",
+            "👤 ชื่อเกษตรกรผู้รับคำปรึกษา:", placeholder="ตัวอย่าง: นายสมศักดิ์ รักดี"
         )
-        officer_in_charge = st.text_input(
-            "👨‍🌾 ผู้รับผิดชอบแปลง:",
-            placeholder="ตัวอย่าง: นายรุ่งเรือง จรรยา",
-        )
+        officer_in_charge = officer_input("👨‍🌾 ผู้รับผิดชอบแปลง:", key="tab1_officer")
 
     with col2:
         field_name = st.text_input(
-            "📍 ชื่อแปลง / ตำบล / หมู่บ้าน:",
-            placeholder="ตัวอย่าง: แปลงบางขนาก A",
+            "📍 ชื่อแปลง / ตำบล / หมู่บ้าน:", placeholder="ตัวอย่าง: แปลงบางขนาก A"
         )
         selected_district = st.selectbox(
             "📍 อำเภอ (จ.ฉะเชิงเทรา):", list(district_coords.keys())
@@ -439,82 +691,59 @@ with tab1:
 
     with col3:
         rice_name = st.selectbox(
-            "🌾 สายพันธุ์ข้าวในแปลง (123 สายพันธุ์):", list(rice_catalog.keys())
+            f"🌾 สายพันธุ์ข้าวในแปลง ({len(rice_catalog)} สายพันธุ์):", list(rice_catalog.keys())
         )
-        planting_method = st.selectbox(
-            "🚜 วิธีการปลูกข้าว:", planting_methods
-        )
+        planting_method = st.selectbox("🚜 วิธีการปลูกข้าว:", planting_methods)
 
     with col4:
-        sow_date = st.date_input(
-            "📅 วันที่เริ่มเพาะปลูก (วันหว่าน):", datetime.date.today()
-        )
+        sow_date = st.date_input("📅 วันที่เริ่มเพาะปลูก (วันหว่าน):", today())
+
+    rice_warnings(rice_name, planting_method)
 
     st.markdown("<br>", unsafe_allow_html=True)
-    if st.button(
-        "📅 คำนวณปฏิทินและบันทึกข้อมูลลงระบบ",
-        type="primary",
-        use_container_width=True,
-    ):
-        if not farmer_name or not field_name:
+    if st.button("📅 คำนวณปฏิทินและบันทึกข้อมูลลงระบบ", type="primary", **STRETCH):
+        if not farmer_name.strip() or not field_name.strip():
             st.error("⚠️ กรุณากรอก 'ชื่อเกษตรกร' และ 'ชื่อแปลง' ก่อนกดบันทึก")
         else:
-            if save_to_db(
-                farmer_name,
-                selected_district,
-                field_name,
-                rice_name,
-                planting_method,
-                sow_date,
-                officer_in_charge,
-            ):
-                st.success(
-                    f"💾 บันทึกและขึ้นทะเบียนแปลงในระบบเรียบร้อย! (อ.{selected_district})"
-                )
-            else:
-                st.warning("⚠️ แปลงนานี้ถูกลงทะเบียนไว้แล้วในระบบ")
-
-            df = get_rice_schedule_advanced(
-                sow_date, rice_name, district_name=selected_district
+            saved = save_to_db(
+                farmer_name.strip(), selected_district, field_name.strip(),
+                rice_name, planting_method, sow_date, officer_in_charge,
             )
-            st.markdown(
-                f"### 📋 ปฏิทินแนะนำสำหรับผู้ใช้: {farmer_name} | {field_name} (อ.{selected_district})"
-            )
-            if officer_in_charge.strip():
-                st.caption(
-                    f"👤 **ผู้รับผิดชอบแปลง:** {officer_in_charge.strip()}"
-                )
+            # เก็บผลไว้ใน session_state เพื่อไม่ให้ตารางหายเมื่อผู้ใช้แตะ widget อื่น
+            st.session_state["tab1_last"] = {
+                "saved": saved,
+                "farmer": farmer_name.strip(),
+                "field": field_name.strip(),
+                "district": selected_district,
+                "rice": rice_name,
+                "sow_date": sow_date,
+                "officer": officer_in_charge,
+            }
 
-            show_df = df.drop(columns=["_danger", "_shifted"])
-
-            def highlight_rows(row):
-                return [
-                    "background-color: #ffebee; font-weight: bold"
-                    if df.loc[row.name, "_danger"]
-                    else ""
-                    for _ in row
-                ]
-
-            st.dataframe(
-                show_df.style.apply(highlight_rows, axis=1),
-                use_container_width=True,
-                hide_index=True,
-            )
+    last = st.session_state.get("tab1_last")
+    if last:
+        if last["saved"]:
+            st.success(f"💾 บันทึกและขึ้นทะเบียนแปลงในระบบเรียบร้อย! (อ.{last['district']})")
+        else:
+            st.warning("⚠️ แปลงนี้ถูกลงทะเบียนไว้แล้วในระบบ (ชื่อเกษตรกร + ชื่อแปลง + วันหว่านซ้ำ)")
+        st.markdown(f"### 📋 ปฏิทินแนะนำสำหรับ: {last['farmer']} | {last['field']} (อ.{last['district']})")
+        if last["officer"] and last["officer"] != "ไม่ระบุ":
+            st.caption(f"👤 **ผู้รับผิดชอบแปลง:** {last['officer']}")
+        new_df = get_rice_schedule(last["sow_date"], last["rice"], district_name=last["district"])
+        st.dataframe(style_schedule(new_df), hide_index=True, **STRETCH)
 
 history_df = load_db()
 
-# --- TAB 2: บันทึกการตรวจแปลงและพบปัญหา ---
+# --- TAB 2: บันทึกการตรวจแปลง ---
 with tab2:
     st.subheader("🩺 บันทึกอาการ ปัญหา หรือข้อสังเกตจากการตรวจแปลง")
     if history_df.empty:
-        st.info(
-            "ℹ️ ยังไม่มีข้อมูลแปลงในระบบ กรุณาขึ้นทะเบียนแปลงในแท็บแรกก่อน"
-        )
+        st.info("ℹ️ ยังไม่มีข้อมูลแปลงในระบบ กรุณาขึ้นทะเบียนแปลงในแท็บแรกก่อน")
     else:
         record_options = {
             row["id"]: (
-                f"{row['ชื่อเกษตรกร']} - อ.{row['อำเภอ']} -"
-                f" {row['ชื่อแปลง/ที่ตั้ง']} (ผู้รับผิดชอบ: {row['ผู้รับผิดชอบแปลง']})"
+                f"{row['ชื่อเกษตรกร']} - อ.{row['อำเภอ']} - {row['ชื่อแปลง/ที่ตั้ง']}"
+                f" (ผู้รับผิดชอบ: {row['ผู้รับผิดชอบแปลง']})"
             )
             for _, row in history_df.iterrows()
         }
@@ -524,74 +753,83 @@ with tab2:
             format_func=lambda x: record_options[x],
             key="tab2_select",
         )
-
-        target_field = history_df[history_df["id"] == selected_id].iloc[0]
-        current_status = target_field["สถานะ/ปัญหาที่พบ"]
-        current_officer = target_field.get("ผู้รับผิดชอบแปลง", "ไม่ระบุ")
+        target = history_df[history_df["id"] == selected_id].iloc[0]
+        cur_status = target["สถานะ/ปัญหาที่พบ"]
+        cur_has_issue = bool(target["มีปัญหา"])
+        cur_officer = target["ผู้รับผิดชอบแปลง"] or "ไม่ระบุ"
 
         st.info(
-            f"📌 **สถานะ/ปัญหาปัจจุบัน:** {current_status} | 👨‍🌾 **ผู้รับผิดชอบ:**"
-            f" {current_officer}"
+            f"📌 **สถานะปัจจุบัน:** {'⚠️ ' + str(cur_status) if cur_has_issue else '✅ ปกติ'}"
+            f" | 👨‍🌾 **ผู้รับผิดชอบ:** {cur_officer}"
         )
 
-        rice_type = rice_catalog.get(target_field["สายพันธุ์ข้าว"], "พันธุ์เบา")
-        available_activities = [
-            item["activity"] for item in activity_rules[rice_type]
-        ]
+        rice_type = rice_catalog.get(target["สายพันธุ์ข้าว"], "พันธุ์เบา")
+        available_activities = [r["activity"] for r in activity_rules[rice_type]]
+        v2 = st.session_state.get("tab2_ver", 0)  # เปลี่ยนค่าหลังบันทึก เพื่อล้างช่องกรอก
 
         col_a, col_b = st.columns(2)
         with col_a:
             problem_activity = st.selectbox(
-                "📌 เลือกกิจกรรมที่พบอาการ/ปัญหา:",
+                "📌 เลือกกิจกรรมที่เกี่ยวข้อง:",
                 options=["ไม่ระบุ (ภาพรวมแปลง)"] + available_activities,
-                key="tab2_problem_act",
+                key=f"tab2_problem_act_{selected_id}_{v2}",
+            )
+            has_issue = st.checkbox(
+                "🚨 พบปัญหาในการตรวจครั้งนี้",
+                value=cur_has_issue,
+                key=f"tab2_issue_{selected_id}_{v2}",
+                help="ไม่ติ๊ก = แปลงปกติ (สถานะจะถูกรีเซ็ตเป็น 'ปกติ')",
             )
             note_detail = st.text_area(
                 "✍️ รายละเอียดอาการ/ปัญหา หรือข้อสังเกตการตรวจแปลง:",
                 placeholder="ตัวอย่าง: พบเพลี้ยกระโดดสีน้ำตาลระบาดเล็กน้อยบริเวณกลางแปลง",
-                key="tab2_note",
+                key=f"tab2_note_{selected_id}_{v2}",
             )
-
-            act_prefix = (
-                f"[{problem_activity}] "
-                if problem_activity != "ไม่ระบุ (ภาพรวมแปลง)"
-                else ""
-            )
-            final_status_text = (
-                f"{act_prefix}{note_detail}".strip()
-                if note_detail
-                else current_status
-            )
-            st.caption(
-                f"📝 **ข้อความที่จะถูกบันทึกลงฐานข้อมูล:** `{final_status_text}`"
-            )
-
         with col_b:
-            updated_officer = st.text_input(
-                "👨‍🌾 เปลี่ยนผู้รับผิดชอบแปลง (หากมีการเปลี่ยนมือ):",
-                value=current_officer,
-                key="tab2_officer",
+            updated_officer = officer_input(
+                "👨‍🌾 ผู้รับผิดชอบแปลง (เปลี่ยนได้หากมีการเปลี่ยนมือ):",
+                key=f"tab2_officer_{selected_id}_{v2}",
+                current=cur_officer,
             )
 
-        if st.button("💾 บันทึกผลการตรวจแปลง", type="primary"):
-            if update_field_status_only(
-                selected_id, final_status_text, updated_officer
-            ):
-                st.success("✅ บันทึกอาการและสถานะปัญหาเรียบร้อยแล้ว!")
+        btn1, btn2, _ = st.columns([1, 1, 2])
+        with btn1:
+            if st.button("💾 บันทึกผลการตรวจแปลง", type="primary", **STRETCH):
+                if has_issue and not note_detail.strip():
+                    st.error("⚠️ กรุณากรอกรายละเอียดปัญหาที่พบ")
+                else:
+                    add_inspection(selected_id, updated_officer, problem_activity,
+                                   note_detail.strip(), has_issue)
+                    st.session_state["tab2_ver"] = v2 + 1
+                    flash("success", "✅ บันทึกผลการตรวจเรียบร้อยแล้ว")
+                    st.rerun()
+        with btn2:
+            if cur_has_issue and st.button("✅ ปัญหาแก้ไขแล้ว (รีเซ็ตเป็นปกติ)", **STRETCH):
+                add_inspection(selected_id, updated_officer, "ไม่ระบุ (ภาพรวมแปลง)",
+                               "แก้ไขปัญหาเรียบร้อย", False)
+                st.session_state["tab2_ver"] = v2 + 1
+                flash("success", "✅ รีเซ็ตสถานะแปลงเป็นปกติแล้ว")
                 st.rerun()
 
-# --- TAB 3: ปรับเลื่อนวันทำกิจกรรม/ปฏิทิน ---
+        st.markdown("---")
+        st.markdown("**🗂️ ประวัติการตรวจล่าสุดของแปลงนี้ (10 รายการ)**")
+        insp_df = get_inspections(selected_id)
+        if insp_df.empty:
+            st.caption("ยังไม่มีประวัติการตรวจ")
+        else:
+            insp_df["ผล"] = insp_df["has_issue"].apply(lambda v: "⚠️ พบปัญหา" if v else "✅ ปกติ")
+            st.dataframe(insp_df.drop(columns=["has_issue"]), hide_index=True, **STRETCH)
+
+# --- TAB 3: ปรับเลื่อนวันทำกิจกรรม ---
 with tab3:
     st.subheader("🔄 ปรับเลื่อนวันทำกิจกรรมและคำนวณปฏิทินใหม่")
     if history_df.empty:
-        st.info(
-            "ℹ️ ยังไม่มีข้อมูลแปลงในระบบ กรุณาขึ้นทะเบียนแปลงในแท็บแรกก่อน"
-        )
+        st.info("ℹ️ ยังไม่มีข้อมูลแปลงในระบบ กรุณาขึ้นทะเบียนแปลงในแท็บแรกก่อน")
     else:
         record_options_tab3 = {
             row["id"]: (
-                f"{row['ชื่อเกษตรกร']} - อ.{row['อำเภอ']} -"
-                f" {row['ชื่อแปลง/ที่ตั้ง']} (ข้าว: {row['สายพันธุ์ข้าว']})"
+                f"{row['ชื่อเกษตรกร']} - อ.{row['อำเภอ']} - {row['ชื่อแปลง/ที่ตั้ง']}"
+                f" (ข้าว: {row['สายพันธุ์ข้าว']})"
             )
             for _, row in history_df.iterrows()
         }
@@ -601,337 +839,269 @@ with tab3:
             format_func=lambda x: record_options_tab3[x],
             key="tab3_select",
         )
+        t3 = history_df[history_df["id"] == selected_id_tab3].iloc[0]
+        sow_d = parse_date(t3["วันที่เริ่มเพาะปลูก"])
+        events3 = get_shift_events(selected_id_tab3)
+        event_pairs = [(act, days) for _, act, days, _ in events3]
 
-        target_field_tab3 = history_df[
-            history_df["id"] == selected_id_tab3
-        ].iloc[0]
-        raw_shift_val = target_field_tab3["จำนวนวันที่ปรับเลื่อนสะสม"]
-        current_shift = 0 if pd.isna(raw_shift_val) else int(raw_shift_val)
-        last_delayed_act = target_field_tab3.get(
-            "กิจกรรมล่าสุดที่เลื่อน", "ไม่มี"
-        )
+        if events3:
+            st.warning(f"⏱️ **แปลงนี้มีการเลื่อนกิจกรรมแล้ว {len(events3)} ครั้ง** (แต่ละครั้งมีผลกับกิจกรรมนั้นและกิจกรรมถัดไป)")
+            for ev_id, act, days, created in events3:
+                c_info, c_btn = st.columns([5, 1])
+                c_info.write(f"• `{act}` → {fmt_days(days)} (บันทึกเมื่อ {created})")
+                if c_btn.button("↩️ ยกเลิก", key=f"undo_shift_{ev_id}"):
+                    delete_shift_event(ev_id)
+                    flash("success", "↩️ ยกเลิกการเลื่อนรายการนั้นแล้ว")
+                    st.rerun()
+        else:
+            st.success("✅ แปลงนี้ยังไม่มีการเลื่อนกิจกรรม")
 
-        st.warning(
-            f"⏱️ **วันเลื่อนสะสมปัจจุบัน:** +{current_shift} วัน | 📌 **กิจกรรมที่เริ่มเลื่อนล่าสุด:** `{last_delayed_act}`"
-        )
+        rice_type3 = rice_catalog.get(t3["สายพันธุ์ข้าว"], "พันธุ์เบา")
+        acts3 = [r["activity"] for r in activity_rules[rice_type3]]
 
-        try:
-            sow_d = datetime.datetime.strptime(
-                str(target_field_tab3["วันที่เริ่มเพาะปลูก"]), "%Y-%m-%d"
-            ).date()
-        except Exception:
-            sow_d = datetime.date.today()
-
-        rice_type_tab3 = rice_catalog.get(target_field_tab3["สายพันธุ์ข้าว"], "พันธุ์เบา")
-        available_activities_tab3 = [
-            item["activity"] for item in activity_rules[rice_type_tab3]
-        ]
-
-        col_shift1, col_shift2 = st.columns(2)
-        with col_shift1:
+        v3 = st.session_state.get("tab3_ver", 0)
+        st.markdown("**➕ เพิ่มการเลื่อนกิจกรรมครั้งใหม่**")
+        c1, c2 = st.columns(2)
+        with c1:
             delayed_activity = st.selectbox(
                 "📌 เลือกกิจกรรมที่เริ่มล่าช้ากว่ากำหนด:",
-                options=available_activities_tab3,
-                index=1,
-                key="tab3_delayed_act",
+                options=acts3,
+                index=1 if len(acts3) > 1 else 0,
+                key=f"tab3_delayed_act_{selected_id_tab3}_{v3}",
             )
-        with col_shift2:
+        with c2:
             shift_days = st.number_input(
-                "🔄 ปรับขยับวันเพิ่มเฉพาะกิจกรรมนี้และกิจกรรมถัดไป (วัน):",
-                min_value=-30,
-                max_value=60,
-                value=0,
-                help=(
-                    "เช่น ใส่เลข 2"
-                    " จะทำให้กิจกรรมที่เลือกและกิจกรรมถัดไปเลื่อนช้าออกไป 2 วัน"
-                ),
-                key="tab3_shift_days",
+                "🔄 เลื่อนออกไป (วัน) — มีผลกับกิจกรรมนี้และกิจกรรมถัดไป:",
+                min_value=0, max_value=60, value=0,
+                help="เช่น ใส่ 2 จะทำให้กิจกรรมที่เลือกและกิจกรรมถัดไปทั้งหมดเลื่อนช้าออกไป 2 วัน",
+                key=f"tab3_shift_days_{selected_id_tab3}_{v3}",
             )
 
-        preview_df = get_rice_schedule_advanced(
-            sow_d,
-            target_field_tab3["สายพันธุ์ข้าว"],
-            district_name=target_field_tab3["อำเภอ"],
-            base_accum_shift=current_shift,
-            delayed_act_name=delayed_activity
-            if shift_days != 0
-            else last_delayed_act,
-            new_delay_days=shift_days,
+        preview_df = get_rice_schedule(
+            sow_d, t3["สายพันธุ์ข้าว"], district_name=t3["อำเภอ"],
+            events=event_pairs, extra_event=(delayed_activity, int(shift_days)),
         )
-
         st.markdown("---")
-        if shift_days != 0:
-            st.warning(
-                "🔍 **ตัวอย่างผลกระทบจากการเลื่อนกิจกรรม"
-                f" '{delayed_activity}' ออกไป +{shift_days} วัน:**"
-            )
+        if shift_days > 0:
+            st.warning(f"🔍 **ตัวอย่างผลกระทบจากการเลื่อน '{delayed_activity}' ออกไป +{int(shift_days)} วัน:**")
         else:
             st.markdown("📋 **ปฏิทินกิจกรรมปัจจุบัน:**")
-
-        show_preview = preview_df[[
-            "กิจกรรม",
-            "วันตามกำหนดเดิม",
-            "วันที่ปรับใหม่",
-            "การปรับเปลี่ยน",
-            "โอกาสเกิดฝนและการประเมิน",
-        ]]
-
-        def highlight_preview(row):
-            is_shifted = preview_df.loc[row.name, "_shifted"]
-            if is_shifted and (shift_days != 0 or current_shift > 0):
-                return [
-                    "background-color: #fff9c4; font-weight: bold" for _ in row
-                ]
-            return ["" for _ in row]
-
-        st.dataframe(
-            show_preview.style.apply(highlight_preview, axis=1),
-            use_container_width=True,
-            hide_index=True,
-        )
+        st.dataframe(style_schedule(preview_df), hide_index=True, **STRETCH)
 
         st.markdown("<br>", unsafe_allow_html=True)
-        if st.button("🚀 ยืนยันการปรับเลื่อนปฏิทินกิจกรรม", type="primary"):
-            if update_field_schedule(
-                selected_id_tab3,
-                delayed_activity if shift_days != 0 else last_delayed_act,
-                shift_days,
-            ):
-                st.success(
-                    "🔄 บันทึกการเลื่อนกิจกรรมเรียบร้อย!"
-                    f" ('{delayed_activity}' ออกไปอีก +{shift_days} วัน)"
-                )
-                st.rerun()
+        if st.button("🚀 ยืนยันการปรับเลื่อนปฏิทินกิจกรรม", type="primary", disabled=(shift_days == 0)):
+            add_shift_event(selected_id_tab3, delayed_activity, int(shift_days))
+            st.session_state["tab3_ver"] = v3 + 1
+            flash("success", f"🔄 บันทึกการเลื่อนเรียบร้อย ('{delayed_activity}' ออกไป +{int(shift_days)} วัน)")
+            st.rerun()
 
-# --- TAB 4: แดชบอร์ดสรุปภาพรวมและจัดการแปลง ---
+# --- TAB 4: แดชบอร์ด ---
 with tab4:
     st.subheader("ภาพรวม")
-    
+
     if history_df.empty:
         st.info("ℹ️ ปัจจุบันยังไม่มีข้อมูลแปลงนาในฐานข้อมูลส่วนกลาง")
     else:
-        # เตรียมคอลัมน์ประเมินปัญหา
-        history_df["is_alert"] = history_df["สถานะ/ปัญหาที่พบ"].apply(is_alert_status)
-        
-        # 1. Responsible Person Filter (ผู้รับผิดชอบ)
-        officers_list = ["ทั้งหมด (ทุกผู้รับผิดชอบ)"] + sorted(
-            [x for x in history_df["ผู้รับผิดชอบแปลง"].unique() if x and x.strip() != ""]
+        history_df["is_alert"] = history_df["มีปัญหา"].fillna(0).astype(int) == 1
+
+        # ตัวกรอง: ผู้รับผิดชอบ + ค้นหาชื่อเกษตรกร/แปลง
+        ALL_OFFICERS = "ทั้งหมด (ทุกผู้รับผิดชอบ)"
+        officers_list = [ALL_OFFICERS] + sorted(
+            {x for x in history_df["ผู้รับผิดชอบแปลง"].dropna().unique() if str(x).strip()}
         )
-        
-        col_filter, _ = st.columns([1, 2])
-        with col_filter:
+        f1, f2, _ = st.columns([1, 1, 1])
+        with f1:
             selected_manager = st.selectbox("ผู้รับผิดชอบ:", options=officers_list, key="tab4_manager_filter")
+        with f2:
+            keyword = st.text_input("🔎 ค้นหาชื่อเกษตรกร/ชื่อแปลง:", key="tab4_keyword").strip()
 
-        # กรองข้อมูลตามที่เลือก
-        if selected_manager != "ทั้งหมด (ทุกผู้รับผิดชอบ)":
-            df_filtered = history_df[history_df["ผู้รับผิดชอบแปลง"] == selected_manager].copy()
-        else:
-            df_filtered = history_df.copy()
+        df_filtered = history_df.copy()
+        if selected_manager != ALL_OFFICERS:
+            df_filtered = df_filtered[df_filtered["ผู้รับผิดชอบแปลง"] == selected_manager]
+        if keyword:
+            mask = (
+                df_filtered["ชื่อเกษตรกร"].str.contains(keyword, case=False, na=False, regex=False)
+                | df_filtered["ชื่อแปลง/ที่ตั้ง"].str.contains(keyword, case=False, na=False, regex=False)
+            )
+            df_filtered = df_filtered[mask]
 
-        # กรณีค้นหาแล้วไม่มีข้อมูลเลย
         if df_filtered.empty:
-            st.warning("ไม่มีข้อมูลแปลงสำหรับผู้รับผิดชอบรายนี้")
+            st.warning("ไม่พบข้อมูลแปลงตามเงื่อนไขที่เลือก")
         else:
-            # 2. KPI Overview Cards (3 Cards)
-            total_farmers = df_filtered["ชื่อเกษตรกร"].nunique()
-            total_plots = len(df_filtered)
-            plots_with_issues = df_filtered["is_alert"].sum()
+            k1, k2, k3 = st.columns(3)
+            k1.metric("👥 จำนวนเกษตรกร", f"{df_filtered['ชื่อเกษตรกร'].nunique()} คน")
+            k2.metric("🌾 จำนวนแปลงทั้งหมด", f"{len(df_filtered)} แปลง")
+            k3.metric("🚨 แปลงที่มีปัญหา", f"{int(df_filtered['is_alert'].sum())} แปลง")
 
-            kpi1, kpi2, kpi3 = st.columns(3)
-            with kpi1:
-                st.metric("👥 จำนวนเกษตรกร", f"{total_farmers} คน")
-            with kpi2:
-                st.metric("🌾 จำนวนแปลงทั้งหมด", f"{total_plots} แปลง")
-            with kpi3:
-                st.metric("🚨 แปลงที่มีปัญหา", f"{plots_with_issues} แปลง", delta_color="inverse")
+            csv_bytes = df_filtered.drop(columns=["is_alert"]).to_csv(index=False).encode("utf-8-sig")
+            st.download_button(
+                "⬇️ ดาวน์โหลดข้อมูลแปลง (CSV)", csv_bytes,
+                file_name=f"rice_records_{today():%Y%m%d}.csv", mime="text/csv",
+            )
+
+            events_map = load_shift_events()
+            st.markdown("---")
+
+            # --- กิจกรรมที่ต้องทำในช่วงข้างหน้า (ข้ามทุกแปลงตามตัวกรอง) ---
+            st.subheader("📆 กิจกรรมที่ต้องทำในช่วงข้างหน้า")
+            horizon = st.slider("ดูล่วงหน้า (วัน)", min_value=3, max_value=30, value=7, key="tab4_horizon")
+            limit_day = today() + timedelta(days=horizon)
+            upcoming = []
+            for _, r in df_filtered.iterrows():
+                sched = get_rice_schedule(
+                    parse_date(r["วันที่เริ่มเพาะปลูก"]), r["สายพันธุ์ข้าว"],
+                    district_name=r["อำเภอ"], events=events_map.get(r["id"], []),
+                )
+                due = sched[(sched["_end"] >= today()) & (sched["_start"] <= limit_day)]
+                for _, s in due.iterrows():
+                    upcoming.append({
+                        "_sort": s["_start"],
+                        "เกษตรกร": r["ชื่อเกษตรกร"],
+                        "แปลง": r["ชื่อแปลง/ที่ตั้ง"],
+                        "อำเภอ": r["อำเภอ"],
+                        "กิจกรรม": s["กิจกรรม"],
+                        "ช่วงวันที่": s["วันที่ปรับใหม่"],
+                        "ฝน/คำแนะนำ": s["โอกาสเกิดฝนและการประเมิน"]
+                        + ("" if s["คำแนะนำ"] == "-" else f" | {s['คำแนะนำ']}"),
+                    })
+            if upcoming:
+                up_df = pd.DataFrame(upcoming).sort_values("_sort").drop(columns=["_sort"])
+                st.dataframe(up_df, hide_index=True, **STRETCH)
+            else:
+                st.caption(f"ไม่มีกิจกรรมที่ตรงกับช่วง {horizon} วันข้างหน้า")
 
             st.markdown("---")
-            
-            # --- 3. Interactive Modal Detail View (พื้นที่สำหรับแสดงตารางรายละเอียดเมื่อกดดู) ---
-            if "selected_farmer_tab4" not in st.session_state:
-                st.session_state.selected_farmer_tab4 = None
 
-            if st.session_state.selected_farmer_tab4:
-                target_farmer = st.session_state.selected_farmer_tab4
+            # --- รายละเอียดแปลงของเกษตรกรที่เลือก ---
+            if st.session_state.get("selected_farmer_tab4") not in set(df_filtered["ชื่อเกษตรกร"]):
+                st.session_state["selected_farmer_tab4"] = None
+
+            target_farmer = st.session_state["selected_farmer_tab4"]
+            if target_farmer:
                 st.markdown(f"### 📋 รายละเอียดแปลงเพาะปลูก: {target_farmer}")
-                
-                # กรองข้อมูลเฉพาะเกษตรกรที่ถูกเลือก
                 farmer_df = df_filtered[df_filtered["ชื่อเกษตรกร"] == target_farmer].copy()
-                
-                # เตรียม 8 คอลัมน์ตาม Wireframe
                 farmer_df["อายุข้าว"] = farmer_df["วันที่เริ่มเพาะปลูก"].apply(calculate_rice_age)
                 farmer_df["วันที่ปรับเลื่อน"] = farmer_df["จำนวนวันที่ปรับเลื่อนสะสม"].apply(
-                    lambda x: f"+{int(x)} วัน" if pd.notna(x) and int(x) > 0 else "-"
+                    lambda x: fmt_days(int(x)) if pd.notna(x) and int(x) != 0 else "-"
                 )
                 farmer_df["ปัญหาที่พบ"] = farmer_df.apply(
                     lambda row: f"⚠️ {row['สถานะ/ปัญหาที่พบ']}" if row["is_alert"] else "✅ ปกติ", axis=1
                 )
-                
-                display_cols = [
-                    "ชื่อแปลง/ที่ตั้ง", "อำเภอ", "สายพันธุ์ข้าว", 
-                    "วันที่เริ่มเพาะปลูก", "อายุข้าว", "วันที่ปรับเลื่อน", 
-                    "กิจกรรมล่าสุดที่เลื่อน", "ปัญหาที่พบ"
-                ]
-                
-                display_df = farmer_df[display_cols].copy()
+                display_df = farmer_df[[
+                    "ชื่อแปลง/ที่ตั้ง", "อำเภอ", "สายพันธุ์ข้าว", "วันที่เริ่มเพาะปลูก",
+                    "อายุข้าว", "วันที่ปรับเลื่อน", "กิจกรรมล่าสุดที่เลื่อน", "ปัญหาที่พบ",
+                ]].copy()
                 display_df.columns = [
-                    "1. แปลงที่ (Plot No.)", "2. อำเภอ", "3. สายพันธุ์ข้าว", 
-                    "4. วันเริ่มเพาะปลูก", "5. อายุข้าว", "6. วันที่ปรับเลื่อน", 
-                    "7. กิจกรรมที่เลื่อน", "8. ปัญหาที่พบ"
+                    "1. แปลงที่ (Plot No.)", "2. อำเภอ", "3. สายพันธุ์ข้าว", "4. วันเริ่มเพาะปลูก",
+                    "5. อายุข้าว", "6. วันที่ปรับเลื่อน", "7. กิจกรรมที่เลื่อนล่าสุด", "8. ปัญหาที่พบ",
                 ]
-                
-                st.dataframe(display_df, use_container_width=True, hide_index=True)
-                
+                st.dataframe(display_df, hide_index=True, **STRETCH)
                 if st.button("❌ ปิดหน้าต่างรายละเอียด", type="secondary"):
-                    st.session_state.selected_farmer_tab4 = None
+                    st.session_state["selected_farmer_tab4"] = None
                     st.rerun()
-                    
                 st.markdown("---")
 
-            # --- 4. Farmer Grid List (แปลง) ---
+            # --- การ์ดรายชื่อเกษตรกร ---
             st.subheader("แปลง (รายชื่อเกษตรกร)")
-            
-            # จัดกลุ่มตามเกษตรกร
-            farmers_group = df_filtered.groupby("ชื่อเกษตรกร")
-            
             cols = st.columns(3)
-            col_idx = 0
-            
-            for farmer_name_group, group in farmers_group:
-                plot_count = len(group)
-                issue_count = group["is_alert"].sum()
-                
+            for col_idx, (farmer_key, group) in enumerate(df_filtered.groupby("ชื่อเกษตรกร")):
+                issue_count = int(group["is_alert"].sum())
                 with cols[col_idx % 3]:
-                    # สร้าง UI แบบ Card
                     with st.container(border=True):
-                        st.markdown(f"#### 👤 {farmer_name_group}")
-                        st.write(f"**จำนวนแปลง:** {plot_count} แปลง")
-                        
+                        st.markdown(f"#### 👤 {farmer_key}")
+                        st.write(f"**จำนวนแปลง:** {len(group)} แปลง")
                         if issue_count > 0:
-                            # Warning badge HTML style
-                            st.markdown(f"<div style='background-color: #fee2e2; color: #b91c1c; padding: 4px 8px; border-radius: 6px; display: inline-block; font-size: 14px; font-weight: bold;'>⚠️ พบปัญหา {issue_count} แปลง</div>", unsafe_allow_html=True)
+                            st.markdown(
+                                f"<div style='background-color: #fee2e2; color: #b91c1c; padding: 4px 8px; border-radius: 6px; display: inline-block; font-size: 14px; font-weight: bold;'>⚠️ พบปัญหา {issue_count} แปลง</div>",
+                                unsafe_allow_html=True,
+                            )
                         else:
-                            # Normal badge HTML style
-                            st.markdown(f"<div style='background-color: #d1fae5; color: #047857; padding: 4px 8px; border-radius: 6px; display: inline-block; font-size: 14px; font-weight: bold;'>✅ ปกติ</div>", unsafe_allow_html=True)
-                        
-                        st.write("") # เว้นบรรทัด
-                        if st.button("🔍 ดูรายละเอียดแปลง", key=f"btn_farmer_{farmer_name_group}", use_container_width=True):
-                            st.session_state.selected_farmer_tab4 = farmer_name_group
+                            st.markdown(
+                                "<div style='background-color: #d1fae5; color: #047857; padding: 4px 8px; border-radius: 6px; display: inline-block; font-size: 14px; font-weight: bold;'>✅ ปกติ</div>",
+                                unsafe_allow_html=True,
+                            )
+                        st.write("")
+                        if st.button("🔍 ดูรายละเอียดแปลง", key=f"btn_farmer_{farmer_key}", **STRETCH):
+                            st.session_state["selected_farmer_tab4"] = farmer_key
                             st.rerun()
-                col_idx += 1
 
             st.markdown("---")
-            
-            # --- 5. ค้นหาและจัดการแปลงนาเชิงลึก (ผสานจาก Code 2) ---
-            st.subheader("🔎 ค้นหาและจัดการแปลงนาเชิงลึก (รายแปลง)")
-            
-            col_select, col_action = st.columns([3, 1])
 
+            # --- ค้นหาและจัดการแปลงเชิงลึก ---
+            st.subheader("🔎 ค้นหาและจัดการแปลงนาเชิงลึก (รายแปลง)")
             record_map = {
                 row["id"]: (
-                    f"{row['ชื่อเกษตรกร']} - อ.{row['อำเภอ']} -"
-                    f" {row['ชื่อแปลง/ที่ตั้ง']} (ผู้รับผิดชอบ: {row['ผู้รับผิดชอบแปลง']})"
+                    f"{row['ชื่อเกษตรกร']} - อ.{row['อำเภอ']} - {row['ชื่อแปลง/ที่ตั้ง']}"
+                    f" (ผู้รับผิดชอบ: {row['ผู้รับผิดชอบแปลง']})"
                 )
                 for _, row in df_filtered.iterrows()
             }
+            selected_dashboard_id = st.selectbox(
+                "เลือกแปลงนาเพื่อเรียกดูปฏิทิน แก้ไข หรือลบข้อมูล:",
+                options=list(record_map.keys()),
+                format_func=lambda x: record_map[x],
+                key="dashboard_select",
+            )
+            row = history_df[history_df["id"] == selected_dashboard_id].iloc[0]
+            pid = int(selected_dashboard_id)
+            sow_p = parse_date(row["วันที่เริ่มเพาะปลูก"])
+            events_p = events_map.get(pid, [])
 
-            with col_select:
-                selected_dashboard_id = st.selectbox(
-                    "เลือกแปลงนาเพื่อเรียกดูปฏิทินที่ถูกปรับหรือลบข้อมูล:",
-                    options=list(record_map.keys()),
-                    format_func=lambda x: record_map[x],
-                    key="dashboard_select",
+            st.markdown("### 🔔 รายงานกิจกรรมที่เกิดการเลื่อนล่าช้า")
+            if events_p:
+                lines = "\n".join(f"- **{act}** → {fmt_days(days)}" for act, days in events_p)
+                st.warning(
+                    f"⚠️ **แปลงนี้มีการแจ้งปรับเลื่อนปฏิทิน {len(events_p)} ครั้ง**\n\n{lines}\n\n"
+                    "กิจกรรมตั้งแต่จุดที่เลื่อนเป็นต้นไปถูกปรับวันทำกิจกรรม (ไฮไลต์เหลืองด้านล่าง)"
                 )
+            else:
+                st.success("✅ **แปลงนี้ดำเนินกิจกรรมตรงตามกำหนดเดิมทุกขั้นตอน (ไม่มีกิจกรรมเลื่อนวัน)**")
 
-            if selected_dashboard_id is not None:
-                target_row = history_df[
-                    history_df["id"] == selected_dashboard_id
-                ].iloc[0]
+            st.markdown(
+                f"🔮 **ตารางปฏิทินกิจกรรมปัจจุบัน (อำเภอ: {row['อำเภอ']} | ผู้รับผิดชอบ: {row['ผู้รับผิดชอบแปลง']})**"
+            )
+            rice_warnings(row["สายพันธุ์ข้าว"], row["วิธีการปลูก"])
+            sched_p = get_rice_schedule(sow_p, row["สายพันธุ์ข้าว"], district_name=row["อำเภอ"], events=events_p)
+            st.dataframe(style_schedule(sched_p), hide_index=True, **STRETCH)
 
-                with col_action:
-                    st.write("")
-                    st.write("")
-                    # ซ่อนปุ่มลบไว้ใน expander เพื่อความปลอดภัย
-                    with st.expander("⚠️ การจัดการขั้นสูง"):
-                        st.warning("หากลบแล้วจะไม่สามารถกู้คืนได้")
-                        if st.button(
-                            "🗑️ ยืนยันการลบ",
-                            type="primary",
-                            use_container_width=True,
-                        ):
-                            if delete_field_record(selected_dashboard_id):
-                                st.success(f"ลบแปลงของ {target_row['ชื่อเกษตรกร']} แล้ว")
-                                time.sleep(1) # หน่วงเวลาให้เห็นข้อความสำเร็จ
-                                st.rerun()
+            with st.expander("✏️ แก้ไขข้อมูลแปลง"):
+                with st.form(f"edit_form_{pid}"):
+                    e_farmer = st.text_input("ชื่อเกษตรกร", value=row["ชื่อเกษตรกร"])
+                    e_field = st.text_input("ชื่อแปลง / ตำบล / หมู่บ้าน", value=row["ชื่อแปลง/ที่ตั้ง"])
+                    d_list = list(district_coords.keys())
+                    e_district = st.selectbox(
+                        "อำเภอ", d_list, index=d_list.index(row["อำเภอ"]) if row["อำเภอ"] in d_list else 0)
+                    r_list = list(rice_catalog.keys())
+                    e_rice = st.selectbox(
+                        "สายพันธุ์ข้าว", r_list,
+                        index=r_list.index(row["สายพันธุ์ข้าว"]) if row["สายพันธุ์ข้าว"] in r_list else 0)
+                    e_method = st.selectbox(
+                        "วิธีการปลูก", planting_methods,
+                        index=planting_methods.index(row["วิธีการปลูก"]) if row["วิธีการปลูก"] in planting_methods else 0)
+                    e_sow = st.date_input("วันที่เริ่มเพาะปลูก", value=sow_p)
+                    e_officer = st.text_input("ผู้รับผิดชอบแปลง", value=row["ผู้รับผิดชอบแปลง"] or "")
+                    submitted = st.form_submit_button("💾 บันทึกการแก้ไข", type="primary")
+                if submitted:
+                    if not e_farmer.strip() or not e_field.strip():
+                        st.error("⚠️ กรุณากรอกชื่อเกษตรกรและชื่อแปลง")
+                    else:
+                        result = update_record(pid, e_farmer.strip(), e_district, e_field.strip(),
+                                               e_rice, e_method, e_sow, e_officer)
+                        if result == "duplicate":
+                            st.error("⚠️ มีแปลงอื่นที่ใช้ชื่อเกษตรกร + ชื่อแปลง + วันหว่านเดียวกันอยู่แล้ว")
+                        else:
+                            flash("success", "✅ แก้ไขข้อมูลแปลงเรียบร้อยแล้ว")
+                            st.rerun()
 
-                try:
-                    old_sow_date = datetime.datetime.strptime(
-                        str(target_row["วันที่เริ่มเพาะปลูก"]), "%Y-%m-%d"
-                    ).date()
-                except Exception:
-                    old_sow_date = datetime.date.today()
+            with st.expander("⚠️ การจัดการขั้นสูง"):
+                st.warning("การลบจะลบประวัติการตรวจและการเลื่อนกิจกรรมของแปลงนี้ด้วย และไม่สามารถกู้คืนได้")
+                confirm_delete = st.checkbox("ฉันยืนยันว่าต้องการลบแปลงนี้", key=f"confirm_del_{pid}")
+                if st.button("🗑️ ลบแปลงนี้", type="primary", disabled=not confirm_delete, key=f"del_{pid}"):
+                    delete_field_record(pid)
+                    flash("success", f"ลบแปลงของ {row['ชื่อเกษตรกร']} แล้ว")
+                    st.rerun()
 
-                old_rice = target_row["สายพันธุ์ข้าว"]
-                old_district = target_row.get("อำเภอ", "เมืองฉะเชิงเทรา")
-                accumulated_shift = int(
-                    target_row.get("จำนวนวันที่ปรับเลื่อนสะสม", 0)
-                )
-                delayed_act_saved = str(
-                    target_row.get("กิจกรรมล่าสุดที่เลื่อน", "ไม่มี")
-                )
-
-                old_df = get_rice_schedule_advanced(
-                    old_sow_date,
-                    old_rice,
-                    district_name=old_district,
-                    base_accum_shift=accumulated_shift,
-                    delayed_act_name=delayed_act_saved,
-                )
-
-                st.markdown("### 🔔 รายงานกิจกรรมที่เกิดการเลื่อนล่าช้า")
-                if accumulated_shift > 0 and delayed_act_saved != "ไม่มี":
-                    st.warning(f"""
-                    ⚠️ **แปลงนี้มีการแจ้งปรับเลื่อนปฏิทิน!**
-                    - **จุดตั้งต้นที่เกิดการล่าช้า:** กิจกรรม **"{delayed_act_saved}"**
-                    - **จำนวนวันที่ขยับเลื่อน:** **+{accumulated_shift} วัน**
-                    - **ผลกระทบ:** กิจกรรมตั้งแต่ *"{delayed_act_saved}"* เป็นต้นไป ถูกปรับเลื่อนวันทำกิจกรรมออกไปทั้งหมด (ไฮไลต์ด้วยสีเหลืองด้านล่าง)
-                    """)
-                elif accumulated_shift > 0:
-                    st.warning(
-                        "⚠️ แปลงนี้มีการขยับวันเลื่อนรวม"
-                        f" **+{accumulated_shift} วัน**"
-                    )
-                else:
-                    st.success(
-                        "✅"
-                        " **แปลงนี้ดำเนินกิจกรรมตรงตามกำหนดเดิมทุกขั้นตอน"
-                        " (ไม่มีกิจกรรมเลื่อนวัน)**"
-                    )
-
-                st.markdown(
-                    f"🔮 **ตารางปฏิทินกิจกรรมปัจจุบัน (อำเภอ: {old_district} |"
-                    f" ผู้รับผิดชอบ: {target_row.get('ผู้รับผิดชอบแปลง', 'ไม่ระบุ')})**"
-                )
-
-                show_old_df = old_df.drop(columns=["_danger", "_shifted"])
-
-                def highlight_rows_dashboard(row):
-                    is_danger = old_df.loc[row.name, "_danger"]
-                    is_shifted = old_df.loc[row.name, "_shifted"]
-                    if is_danger:
-                        return [
-                            "background-color: #ffebee; font-weight: bold"
-                            for _ in row
-                        ]
-                    elif is_shifted and accumulated_shift > 0:
-                        return [
-                            "background-color: #fff9c4; font-weight: bold"
-                            for _ in row
-                        ]
-                    return ["" for _ in row]
-
-                st.dataframe(
-                    show_old_df.style.apply(highlight_rows_dashboard, axis=1),
-                    use_container_width=True,
-                    hide_index=True,
-                )
+                if os.path.exists(DB_FILE):
+                    with open(DB_FILE, "rb") as f:
+                        st.download_button("💽 สำรองฐานข้อมูล (.db)", f.read(),
+                                           file_name=f"rice_records_backup_{today():%Y%m%d}.db")
