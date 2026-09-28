@@ -29,12 +29,10 @@ st.set_page_config(
 # ตั้ง path ของไฟล์ฐานข้อมูลผ่าน environment variable ได้ (ชี้ไปยังดิสก์ถาวรเมื่อ deploy)
 DB_FILE = os.environ.get("RICE_DB_PATH", "rice_records.db")
 # เกณฑ์ % ฝนที่ถือว่าไม่เหมาะกับการพ่นยา (เทียบกับค่าที่ได้จากแหล่งพยากรณ์โดยตรง)
-# หมายเหตุ: ค่า PercentRainCover ของกรมอุตุฯ คือสัดส่วนพื้นที่ที่คาดว่ามีฝน ไม่ใช่โอกาสฝน ณ จุดใดจุดหนึ่ง
-# หากเกณฑ์ 60 เข้มหรือหลวมเกินไปสำหรับข้อมูลชุดนี้ ให้ปรับตรงนี้
 RAIN_LIMIT = 60
 
-# แหล่งพยากรณ์อากาศ: "tmd" = กรมอุตุนิยมวิทยา (ค่าเริ่มต้น) หรือ "openmeteo"
-WEATHER_SOURCE = os.environ.get("WEATHER_SOURCE", "tmd").strip().lower()
+# แหล่งพยากรณ์อากาศ: ปรับมาใช้ openmeteo เป็นค่าเริ่มต้น (ฟรีและไม่ต้องใช้ API Key)
+WEATHER_SOURCE = os.environ.get("WEATHER_SOURCE", "openmeteo").strip().lower()
 TMD_URL = "https://data.tmd.go.th/api/WeatherForecast7Days/v2/"
 TMD_PROVINCE = "ฉะเชิงเทรา"  # API ของกรมอุตุฯ เป็นระดับจังหวัด (ล่วงหน้า 7 วัน)
 
