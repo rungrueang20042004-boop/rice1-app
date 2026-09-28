@@ -1,9 +1,11 @@
 import contextlib
 import datetime
 import hmac
+import json
 import os
 import re
 import sqlite3
+import threading
 import time
 from datetime import timedelta
 
@@ -29,9 +31,11 @@ st.set_page_config(
 # ตั้ง path ของไฟล์ฐานข้อมูลผ่าน environment variable ได้ (ชี้ไปยังดิสก์ถาวรเมื่อ deploy)
 DB_FILE = os.environ.get("RICE_DB_PATH", "rice_records.db")
 # เกณฑ์ % ฝนที่ถือว่าไม่เหมาะกับการพ่นยา (เทียบกับค่าที่ได้จากแหล่งพยากรณ์โดยตรง)
+# หมายเหตุ: ค่า PercentRainCover ของกรมอุตุฯ คือสัดส่วนพื้นที่ที่คาดว่ามีฝน ไม่ใช่โอกาสฝน ณ จุดใดจุดหนึ่ง
+# หากเกณฑ์ 60 เข้มหรือหลวมเกินไปสำหรับข้อมูลชุดนี้ ให้ปรับตรงนี้
 RAIN_LIMIT = 60
 
-# แหล่งพยากรณ์อากาศ: ปรับมาใช้ openmeteo เป็นค่าเริ่มต้น (ฟรีและไม่ต้องใช้ API Key)
+# แหล่งพยากรณ์อากาศ: "openmeteo" = Open-Meteo (ค่าเริ่มต้น ไม่ต้องใช้ key) หรือ "tmd" = กรมอุตุนิยมวิทยา
 WEATHER_SOURCE = os.environ.get("WEATHER_SOURCE", "openmeteo").strip().lower()
 TMD_URL = "https://data.tmd.go.th/api/WeatherForecast7Days/v2/"
 TMD_PROVINCE = "ฉะเชิงเทรา"  # API ของกรมอุตุฯ เป็นระดับจังหวัด (ล่วงหน้า 7 วัน)
@@ -220,28 +224,476 @@ chachoengsao_climatology = {
 }
 
 # ---------------------------------------------------------
-# 2. ฐานข้อมูล SQLite
+# 2. ที่เก็บข้อมูล: Google Sheets (ตั้ง GSHEET_ID) / Postgres (ตั้ง DATABASE_URL) / SQLite ในเครื่อง
 # ---------------------------------------------------------
+_sheet_raw = str(get_secret("GSHEET_ID") or "").strip()
+_sheet_match = re.search(r"/spreadsheets/d/([A-Za-z0-9_-]+)", _sheet_raw)
+SHEET_ID = _sheet_match.group(1) if _sheet_match else _sheet_raw  # วางทั้งลิงก์หรือเฉพาะ ID ก็ได้
+USE_SHEETS = bool(SHEET_ID)
+DATABASE_URL = str(get_secret("DATABASE_URL") or "").strip()
+USE_PG = bool(DATABASE_URL) and not USE_SHEETS
+ON_CLOUD = BASE_DIR.startswith("/mount/src")  # รันบน Streamlit Community Cloud หรือไม่
+if USE_SHEETS:
+    DB_LABEL = "Google Sheets (ข้อมูลอยู่ในสเปรดชีตของคุณ)"
+elif USE_PG:
+    DB_LABEL = "Postgres (ออนไลน์ ข้อมูลถาวร)"
+else:
+    DB_LABEL = f"SQLite ไฟล์ {DB_FILE} (ในเครื่องที่รันแอป)"
+
+if USE_PG:
+    try:
+        import psycopg2
+        import psycopg2.pool
+    except ImportError:
+        st.error("❌ ตั้งค่า DATABASE_URL แล้ว แต่ยังไม่ได้ติดตั้ง psycopg2-binary (เพิ่มลงใน requirements.txt)")
+        st.stop()
+
+
+# อ่านข้อมูลจากที่เก็บออนไลน์ทุกครั้งที่กดปุ่มจะช้าและกินโควตา จึงจำผลไว้ชั่วครู่ และล้างทันทีที่มีการเขียนข้อมูล
+_CACHED_READS = []
+
+
+def cached_read(func):
+    wrapped = st.cache_data(ttl=60, show_spinner=False)(func)
+    _CACHED_READS.append(wrapped)
+    return wrapped
+
+
+def clear_data_cache():
+    for wrapped in _CACHED_READS:
+        clear = getattr(wrapped, "clear", None)
+        if clear:
+            clear()
+
+
+def _plain(value):
+    """แปลงค่า numpy (เช่น numpy.int64 จาก pandas) เป็นค่า Python ธรรมดา"""
+    if hasattr(value, "item") and not isinstance(value, (str, bytes)):
+        return value.item()
+    return value
+
+
+def _to_int(value, default=0):
+    try:
+        return int(float(value))
+    except (TypeError, ValueError):
+        return default
+
+
+# =========================================================
+# 2A. Google Sheets (เรียก REST API ของ Google Sheets โดยตรง)
+# =========================================================
+# โครงสร้างชีต: 3 แท็บ แต่ละแท็บมีหัวตารางที่แถวที่ 1 (แอปสร้างให้อัตโนมัติ)
+SHEET_TABS = {
+    "rice_records": [
+        "id", "farmer_name", "district", "field_name", "rice_species", "planting_method",
+        "sow_date", "officer_in_charge", "created_at", "status", "has_issue", "updated_at",
+    ],
+    "schedule_shifts": ["id", "record_id", "activity", "days", "created_at"],
+    "inspections": ["id", "record_id", "inspected_at", "officer", "activity", "note", "has_issue"],
+}
+SHEETS_SCOPE = "https://www.googleapis.com/auth/spreadsheets"
+SHEET_MIN_ROWS = 10000  # ชีตใหม่มีแค่ 1,000 แถว การเขียนเลยขอบตารางจะล้มเหลว จึงขยายไว้ล่วงหน้า
+
+
+class SheetsError(Exception):
+    pass
+
+
+class SheetsClient:
+    BASE = "https://sheets.googleapis.com/v4/spreadsheets"
+
+    def __init__(self, spreadsheet_id, session):
+        self.spreadsheet_id = spreadsheet_id
+        self.session = session
+
+    def _call(self, method, path, **kwargs):
+        url = f"{self.BASE}/{self.spreadsheet_id}{path}"
+        resp = None
+        for wait in (0, 2, 5):  # ชนโควตา/เซิร์ฟเวอร์ขัดข้องชั่วคราว: ลองใหม่สูงสุด 3 ครั้ง
+            if wait:
+                time.sleep(wait)
+            resp = self.session.request(method, url, timeout=30, **kwargs)
+            if resp.status_code not in (429, 500, 502, 503, 504):
+                break
+        if resp.status_code >= 400:
+            try:
+                message = resp.json()["error"]["message"]
+            except Exception:
+                message = (resp.text or "")[:200]
+            raise SheetsError(f"HTTP {resp.status_code}: {message}")
+        return resp.json() if resp.content else {}
+
+    def tab_info(self):
+        """คืน dict: ชื่อแท็บ -> {'sheetId', 'rowCount', 'columnCount'}"""
+        data = self._call("GET", "", params={"fields": "sheets.properties"})
+        info = {}
+        for s in data.get("sheets", []):
+            p = s["properties"]
+            grid = p.get("gridProperties", {})
+            info[p["title"]] = {"sheetId": p["sheetId"], "rowCount": grid.get("rowCount", 1000),
+                                "columnCount": grid.get("columnCount", 26)}
+        return info
+
+    def structure_update(self, requests_body):
+        self._call("POST", ":batchUpdate", json={"requests": requests_body})
+
+    def batch_get(self, titles):
+        """อ่านหลายแท็บในคำขอเดียว คืน list ของ values (list of rows) ตามลำดับที่ขอ"""
+        data = self._call(
+            "GET", "/values:batchGet",
+            params={"ranges": list(titles), "valueRenderOption": "UNFORMATTED_VALUE"},
+        )
+        return [vr.get("values", []) for vr in data.get("valueRanges", [])]
+
+    def batch_put(self, items):
+        """เขียนหลายช่วงในคำขอเดียว items = [{'range': 'tab!A2:L2', 'values': [[...]]}]"""
+        if items:
+            self._call("POST", "/values:batchUpdate",
+                       json={"valueInputOption": "RAW", "data": items})
+
+    def batch_clear(self, ranges):
+        if ranges:
+            self._call("POST", "/values:batchClear", json={"ranges": ranges})
+
+
+def _service_account_info():
+    raw = get_secret("GCP_SERVICE_ACCOUNT_JSON")
+    if raw:
+        info = json.loads(raw) if isinstance(raw, str) else dict(raw)
+    else:
+        try:
+            table = st.secrets.get("gcp_service_account")
+        except Exception:
+            table = None
+        if not table:
+            raise RuntimeError("ยังไม่ได้ตั้งค่า GCP_SERVICE_ACCOUNT_JSON ใน Secrets")
+        info = dict(table)
+    if isinstance(info.get("private_key"), str):
+        info["private_key"] = info["private_key"].replace("\\n", "\n")
+    return info
+
+
+@st.cache_resource(show_spinner=False)
+def get_sheets_client(spreadsheet_id):
+    from google.auth.transport.requests import AuthorizedSession
+    from google.oauth2 import service_account
+
+    creds = service_account.Credentials.from_service_account_info(
+        _service_account_info(), scopes=[SHEETS_SCOPE]
+    )
+    return SheetsClient(spreadsheet_id, AuthorizedSession(creds))
+
+
+@st.cache_resource(show_spinner=False)
+def get_write_lock():
+    return threading.Lock()  # ให้เขียนทีละคำสั่ง กัน id ซ้ำเมื่อหลายคนบันทึกพร้อมกัน
+
+
+def _col_letter(n):
+    return chr(64 + n)
+
+
+def _sheet_range(title, first_row, last_row=None):
+    last_row = last_row or first_row
+    return f"{title}!A{first_row}:{_col_letter(len(SHEET_TABS[title]))}{last_row}"
+
+
+def _sheet_row_values(title, record):
+    return [("" if record.get(c) is None else record.get(c)) for c in SHEET_TABS[title]]
+
+
+_INT_COLUMNS = {"id", "record_id", "days", "has_issue"}
+
+
+def _sheet_rows_to_dicts(title, values):
+    cols = SHEET_TABS[title]
+    out = []
+    for index, row in enumerate(values[1:], start=2):  # แถว 1 คือหัวตาราง
+        row = list(row) + [""] * (len(cols) - len(row))
+        d = dict(zip(cols, row[: len(cols)]))
+        if d["id"] in ("", None):
+            continue  # แถวว่าง/แถวที่ถูกลบ
+        for c in cols:
+            if c in _INT_COLUMNS:
+                d[c] = _to_int(d[c])
+            else:
+                d[c] = "" if d[c] is None else str(d[c])
+        d["_row"] = index
+        out.append(d)
+    return out
+
+
+def _sheets_fetch(titles):
+    """อ่านข้อมูลสดจากชีต คืน (tables: title -> list of dict, next_row: title -> เลขแถวถัดไปที่ว่าง)"""
+    titles = tuple(titles)
+    blocks = get_sheets_client(SHEET_ID).batch_get(titles)
+    tables, next_row = {}, {}
+    for title, values in zip(titles, blocks):
+        tables[title] = _sheet_rows_to_dicts(title, values)
+        next_row[title] = max(len(values), 1) + 1
+    return tables, next_row
+
+
+def _next_id(rows):
+    return max([r["id"] for r in rows], default=0) + 1
+
+
+def _init_sheets():
+    """สร้างแท็บและหัวตารางที่ยังไม่มี (ไม่แตะข้อมูลเดิม) และตรวจว่าหัวตารางไม่ถูกแก้"""
+    client = get_sheets_client(SHEET_ID)
+    info = client.tab_info()
+    missing = [t for t in SHEET_TABS if t not in info]
+    if missing:
+        client.structure_update([
+            {"addSheet": {"properties": {"title": t, "gridProperties": {
+                "rowCount": SHEET_MIN_ROWS, "columnCount": len(SHEET_TABS[t])}}}}
+            for t in missing
+        ])
+        info = client.tab_info()
+    resize = []
+    for title, cols in SHEET_TABS.items():
+        p = info[title]
+        if p["rowCount"] < SHEET_MIN_ROWS or p["columnCount"] < len(cols):
+            resize.append({"updateSheetProperties": {
+                "properties": {"sheetId": p["sheetId"], "gridProperties": {
+                    "rowCount": max(p["rowCount"], SHEET_MIN_ROWS),
+                    "columnCount": max(p["columnCount"], len(cols))}},
+                "fields": "gridProperties.rowCount,gridProperties.columnCount"}})
+    if resize:
+        client.structure_update(resize)
+    blocks = client.batch_get(tuple(SHEET_TABS))
+    header_writes = []
+    for title, values in zip(SHEET_TABS, blocks):
+        expected = SHEET_TABS[title]
+        header = [str(v) for v in values[0]] if values else []
+        if not header:
+            header_writes.append({"range": _sheet_range(title, 1), "values": [expected]})
+        elif header != expected:
+            raise SheetsError(f"หัวตารางของแท็บ {title} ไม่ตรงกับที่ระบบต้องการ (ห้ามแก้แถวที่ 1)")
+    client.batch_put(header_writes)
+
+
+@cached_read
+def _sheets_snapshot():
+    tables, _ = _sheets_fetch(tuple(SHEET_TABS))
+    return tables
+
+
+def _sheets_save(farmer, district, field, rice, method, sow_str, officer_str, ts):
+    with get_write_lock():
+        tables, nxt = _sheets_fetch(("rice_records",))
+        rows = tables["rice_records"]
+        if any(r["farmer_name"] == farmer and r["field_name"] == field and r["sow_date"] == sow_str
+               for r in rows):
+            return False
+        record = {
+            "id": _next_id(rows), "farmer_name": farmer, "district": district, "field_name": field,
+            "rice_species": rice, "planting_method": method, "sow_date": sow_str,
+            "officer_in_charge": officer_str, "created_at": ts, "status": "ปกติ",
+            "has_issue": 0, "updated_at": ts,
+        }
+        get_sheets_client(SHEET_ID).batch_put([{
+            "range": _sheet_range("rice_records", nxt["rice_records"]),
+            "values": [_sheet_row_values("rice_records", record)],
+        }])
+    return True
+
+
+def _sheets_update_record(record_id, farmer, district, field, rice, method, sow_str, officer_str):
+    with get_write_lock():
+        tables, _ = _sheets_fetch(("rice_records",))
+        rows = tables["rice_records"]
+        target = next((r for r in rows if r["id"] == record_id), None)
+        if target is None:
+            return "ok"
+        if any(r["id"] != record_id and r["farmer_name"] == farmer and r["field_name"] == field
+               and r["sow_date"] == sow_str for r in rows):
+            return "duplicate"
+        target.update(farmer_name=farmer, district=district, field_name=field, rice_species=rice,
+                      planting_method=method, sow_date=sow_str, officer_in_charge=officer_str,
+                      updated_at=now_str())
+        get_sheets_client(SHEET_ID).batch_put([{
+            "range": _sheet_range("rice_records", target["_row"]),
+            "values": [_sheet_row_values("rice_records", target)],
+        }])
+    return "ok"
+
+
+def _sheets_add_inspection(record_id, officer_str, activity, note, has_issue, status_text, ts):
+    with get_write_lock():
+        tables, nxt = _sheets_fetch(("rice_records", "inspections"))
+        target = next((r for r in tables["rice_records"] if r["id"] == record_id), None)
+        items = [{
+            "range": _sheet_range("inspections", nxt["inspections"]),
+            "values": [_sheet_row_values("inspections", {
+                "id": _next_id(tables["inspections"]), "record_id": record_id, "inspected_at": ts,
+                "officer": officer_str, "activity": activity, "note": note,
+                "has_issue": 1 if has_issue else 0,
+            })],
+        }]
+        if target is not None:
+            target.update(status=status_text if has_issue else "ปกติ", has_issue=1 if has_issue else 0,
+                          officer_in_charge=officer_str, updated_at=ts)
+            items.append({"range": _sheet_range("rice_records", target["_row"]),
+                          "values": [_sheet_row_values("rice_records", target)]})
+        get_sheets_client(SHEET_ID).batch_put(items)
+
+
+def _sheets_add_shift(record_id, activity, days, ts):
+    with get_write_lock():
+        tables, nxt = _sheets_fetch(("rice_records", "schedule_shifts"))
+        items = [{
+            "range": _sheet_range("schedule_shifts", nxt["schedule_shifts"]),
+            "values": [_sheet_row_values("schedule_shifts", {
+                "id": _next_id(tables["schedule_shifts"]), "record_id": record_id,
+                "activity": activity, "days": int(days), "created_at": ts,
+            })],
+        }]
+        target = next((r for r in tables["rice_records"] if r["id"] == record_id), None)
+        if target is not None:
+            target["updated_at"] = ts
+            items.append({"range": _sheet_range("rice_records", target["_row"]),
+                          "values": [_sheet_row_values("rice_records", target)]})
+        get_sheets_client(SHEET_ID).batch_put(items)
+
+
+def _sheets_delete_shift(event_id):
+    with get_write_lock():
+        tables, _ = _sheets_fetch(("schedule_shifts",))
+        ranges = [_sheet_range("schedule_shifts", r["_row"])
+                  for r in tables["schedule_shifts"] if r["id"] == event_id]
+        get_sheets_client(SHEET_ID).batch_clear(ranges)
+
+
+def _sheets_delete_record(record_id):
+    with get_write_lock():
+        tables, _ = _sheets_fetch(tuple(SHEET_TABS))
+        ranges = [_sheet_range("rice_records", r["_row"])
+                  for r in tables["rice_records"] if r["id"] == record_id]
+        ranges += [_sheet_range("schedule_shifts", r["_row"])
+                   for r in tables["schedule_shifts"] if r["record_id"] == record_id]
+        ranges += [_sheet_range("inspections", r["_row"])
+                   for r in tables["inspections"] if r["record_id"] == record_id]
+        get_sheets_client(SHEET_ID).batch_clear(ranges)  # ล้างค่าในแถว (คงเลขแถวของข้อมูลอื่นไว้)
+
+
+def _sheets_load_db():
+    tables = _sheets_snapshot()
+    shifts = {}
+    for s in tables["schedule_shifts"]:
+        shifts.setdefault(s["record_id"], []).append(s)
+    rows = []
+    for r in sorted(tables["rice_records"], key=lambda x: x["id"]):
+        mine = sorted(shifts.get(r["id"], []), key=lambda x: x["id"])
+        rows.append({
+            "id": r["id"],
+            "ชื่อเกษตรกร": r["farmer_name"], "อำเภอ": r["district"],
+            "ชื่อแปลง/ที่ตั้ง": r["field_name"], "สายพันธุ์ข้าว": r["rice_species"],
+            "วิธีการปลูก": r["planting_method"], "วันที่เริ่มเพาะปลูก": r["sow_date"],
+            "ผู้รับผิดชอบแปลง": r["officer_in_charge"] or "ไม่ระบุ", "วันบันทึกข้อมูล": r["created_at"],
+            "สถานะ/ปัญหาที่พบ": r["status"] or "ปกติ", "มีปัญหา": r["has_issue"],
+            "จำนวนวันที่ปรับเลื่อนสะสม": sum(s["days"] for s in mine),
+            "กิจกรรมล่าสุดที่เลื่อน": mine[-1]["activity"] if mine else "ไม่มี",
+            "วันที่อัปเดตล่าสุด": r["updated_at"],
+        })
+    columns = ["id", "ชื่อเกษตรกร", "อำเภอ", "ชื่อแปลง/ที่ตั้ง", "สายพันธุ์ข้าว", "วิธีการปลูก",
+               "วันที่เริ่มเพาะปลูก", "ผู้รับผิดชอบแปลง", "วันบันทึกข้อมูล", "สถานะ/ปัญหาที่พบ",
+               "มีปัญหา", "จำนวนวันที่ปรับเลื่อนสะสม", "กิจกรรมล่าสุดที่เลื่อน", "วันที่อัปเดตล่าสุด"]
+    return pd.DataFrame(rows, columns=columns)
+
+
+def _sheets_inspections(record_id, limit):
+    mine = sorted((i for i in _sheets_snapshot()["inspections"] if i["record_id"] == record_id),
+                  key=lambda x: x["id"], reverse=True)[:limit]
+    return pd.DataFrame(
+        [{"วันที่ตรวจ": i["inspected_at"], "ผู้ตรวจ": i["officer"], "กิจกรรม": i["activity"],
+          "รายละเอียด": i["note"], "has_issue": i["has_issue"]} for i in mine],
+        columns=["วันที่ตรวจ", "ผู้ตรวจ", "กิจกรรม", "รายละเอียด", "has_issue"],
+    )
+
+
+# =========================================================
+# 2B. SQL (Postgres / SQLite)
+# =========================================================
+@st.cache_resource(show_spinner=False)
+def get_pg_pool(dsn):
+    return psycopg2.pool.ThreadedConnectionPool(1, 5, dsn=dsn, connect_timeout=10)
+
+
+class _Conn:
+    """ห่อการเชื่อมต่อ ให้เขียน SQL ด้วยเครื่องหมาย ? แบบเดียวกันทั้ง SQLite และ Postgres"""
+
+    def __init__(self, raw, pg):
+        self.raw = raw
+        self.pg = pg
+
+    def execute(self, sql, params=()):
+        params = tuple(_plain(p) for p in params)
+        if self.pg:
+            cur = self.raw.cursor()
+            cur.execute(sql.replace("?", "%s"), params)
+            return cur
+        return self.raw.execute(sql, params)
+
+
 @contextlib.contextmanager
 def db():
-    """เปิดการเชื่อมต่อ, commit เมื่อสำเร็จ, rollback เมื่อผิดพลาด และปิดการเชื่อมต่อเสมอ"""
-    conn = sqlite3.connect(DB_FILE, timeout=10.0)
-    try:
-        yield conn
-        conn.commit()
-    except Exception:
-        conn.rollback()
-        raise
-    finally:
-        conn.close()
+    """เปิดการเชื่อมต่อ, commit เมื่อสำเร็จ, rollback เมื่อผิดพลาด และคืน/ปิดการเชื่อมต่อเสมอ"""
+    if USE_PG:
+        pool = get_pg_pool(DATABASE_URL)
+        raw = pool.getconn()
+        try:
+            try:  # ตรวจว่าการเชื่อมต่อยังใช้ได้ (ฝั่งเซิร์ฟเวอร์อาจตัดการเชื่อมต่อที่ว่างนาน)
+                with raw.cursor() as cur:
+                    cur.execute("SELECT 1")
+                raw.rollback()
+            except Exception:
+                pool.putconn(raw, close=True)
+                raw = pool.getconn()
+            try:
+                yield _Conn(raw, True)
+                raw.commit()
+            except Exception:
+                raw.rollback()
+                raise
+        finally:
+            pool.putconn(raw)
+    else:
+        raw = sqlite3.connect(DB_FILE, timeout=10.0)
+        try:
+            yield _Conn(raw, False)
+            raw.commit()
+        except Exception:
+            raw.rollback()
+            raise
+        finally:
+            raw.close()
 
 
-def init_db():
+def query_df(conn, sql, params=()):
+    cur = conn.execute(sql, params)
+    columns = [d[0] for d in cur.description]
+    return pd.DataFrame(cur.fetchall(), columns=columns)
+
+
+def table_columns(conn, table):
+    if conn.pg:
+        rows = conn.execute(
+            "SELECT column_name FROM information_schema.columns "
+            "WHERE table_name = ? AND table_schema = current_schema()",
+            (table,),
+        ).fetchall()
+        return {r[0] for r in rows}
+    return {r[1] for r in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+
+
+def _init_sql():
     with db() as conn:
-        c = conn.cursor()
-        c.execute("""
+        pk = "SERIAL PRIMARY KEY" if conn.pg else "INTEGER PRIMARY KEY AUTOINCREMENT"
+        conn.execute(f"""
             CREATE TABLE IF NOT EXISTS rice_records (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id {pk},
                 farmer_name TEXT NOT NULL,
                 district TEXT NOT NULL,
                 field_name TEXT NOT NULL,
@@ -257,22 +709,22 @@ def init_db():
                 updated_at TEXT NOT NULL
             )
         """)
-        cols = {r[1] for r in c.execute("PRAGMA table_info(rice_records)").fetchall()}
+        cols = table_columns(conn, "rice_records")
         if "officer_in_charge" not in cols:
-            c.execute("ALTER TABLE rice_records ADD COLUMN officer_in_charge TEXT DEFAULT 'ไม่ระบุ'")
+            conn.execute("ALTER TABLE rice_records ADD COLUMN officer_in_charge TEXT DEFAULT 'ไม่ระบุ'")
         if "has_issue" not in cols:
-            c.execute("ALTER TABLE rice_records ADD COLUMN has_issue INTEGER DEFAULT 0")
+            conn.execute("ALTER TABLE rice_records ADD COLUMN has_issue INTEGER DEFAULT 0")
             # ย้ายข้อมูลเดิม: ถือว่ามีปัญหาเมื่อสถานะไม่ใช่ค่าว่าง/'ปกติ' แบบตรงตัว
-            c.execute("""
+            conn.execute("""
                 UPDATE rice_records SET has_issue = CASE
                     WHEN TRIM(COALESCE(status, '')) IN ('', 'ปกติ', 'None') THEN 0
                     ELSE 1 END
             """)
 
         # เหตุการณ์การเลื่อนกิจกรรม (เก็บทุกครั้ง แทนตัวเลขรวมเพียงค่าเดียว)
-        c.execute("""
+        conn.execute(f"""
             CREATE TABLE IF NOT EXISTS schedule_shifts (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id {pk},
                 record_id INTEGER NOT NULL,
                 activity TEXT NOT NULL,
                 days INTEGER NOT NULL,
@@ -280,9 +732,9 @@ def init_db():
             )
         """)
         # ประวัติการตรวจแปลง
-        c.execute("""
+        conn.execute(f"""
             CREATE TABLE IF NOT EXISTS inspections (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id {pk},
                 record_id INTEGER NOT NULL,
                 inspected_at TEXT NOT NULL,
                 officer TEXT,
@@ -294,7 +746,7 @@ def init_db():
 
         # ย้ายค่า accumulated_shift แบบเดิมมาเป็นเหตุการณ์ (ทำครั้งเดียว แล้วรีเซ็ตค่าเดิมเป็น 0)
         first_activity = activity_rules["พันธุ์เบา"][0]["activity"]
-        c.execute("""
+        conn.execute("""
             INSERT INTO schedule_shifts (record_id, activity, days, created_at)
             SELECT id,
                    CASE WHEN last_delayed_activity IS NULL
@@ -305,16 +757,56 @@ def init_db():
             FROM rice_records
             WHERE accumulated_shift IS NOT NULL AND accumulated_shift <> 0
         """, (first_activity,))
-        c.execute("UPDATE rice_records SET accumulated_shift = 0 WHERE accumulated_shift <> 0")
+        conn.execute("UPDATE rice_records SET accumulated_shift = 0 WHERE accumulated_shift <> 0")
 
 
-init_db()
+@st.cache_resource(show_spinner=False)
+def init_db():
+    """เตรียมที่เก็บข้อมูลครั้งเดียวต่อการรันแอป (ถ้าเชื่อมต่อไม่ได้จะ raise ให้ผู้เรียกแสดงข้อความ)"""
+    if USE_SHEETS:
+        _init_sheets()
+    else:
+        _init_sql()
+    return True
 
 
+def _describe_storage_error(exc):
+    name = type(exc).__name__
+    if USE_SHEETS:
+        text = str(exc)
+        if isinstance(exc, SheetsError):
+            if "HTTP 403" in text:
+                return (f"{text} — ตรวจว่าเปิดใช้ Google Sheets API แล้ว และแชร์สเปรดชีตให้อีเมลของ "
+                        "service account เป็น Editor")
+            if "HTTP 404" in text:
+                return f"{text} — ตรวจว่า GSHEET_ID ถูกต้อง"
+            return text
+        if isinstance(exc, RuntimeError):
+            return text
+        return f"{name} — ตรวจ GSHEET_ID และ GCP_SERVICE_ACCOUNT_JSON ใน Secrets และว่าติดตั้ง google-auth แล้ว"
+    return (f"{name} — ตรวจว่า DATABASE_URL ถูกต้อง และโปรเจกต์ Supabase ไม่ได้ถูกหยุดชั่วคราว "
+            "(โปรเจกต์ฟรีจะหยุดเมื่อไม่มีการใช้งาน 7 วัน ให้เข้า supabase.com แล้วกด Restore)")
+
+
+try:
+    init_db()
+except Exception as exc:
+    st.error(f"❌ เชื่อมต่อที่เก็บข้อมูลไม่สำเร็จ: {_describe_storage_error(exc)}")
+    st.stop()
+
+
+# =========================================================
+# 2C. ฟังก์ชันข้อมูลที่แอปเรียกใช้ (ทำงานเหมือนกันทุกที่เก็บข้อมูล)
+# =========================================================
 def save_to_db(farmer, district, field, rice, method, date_start, officer):
     sow_date_str = date_start.strftime("%Y-%m-%d")
     ts = now_str()
     officer_str = officer.strip() if officer and officer.strip() else "ไม่ระบุ"
+    if USE_SHEETS:
+        saved = _sheets_save(farmer, district, field, rice, method, sow_date_str, officer_str, ts)
+        if saved:
+            clear_data_cache()
+        return saved
     with db() as conn:
         exists = conn.execute(
             "SELECT id FROM rice_records WHERE farmer_name = ? AND field_name = ? AND sow_date = ?",
@@ -331,13 +823,20 @@ def save_to_db(farmer, district, field, rice, method, date_start, officer):
             """,
             (farmer, district, field, rice, method, sow_date_str, officer_str, ts, ts),
         )
-        return True
+    clear_data_cache()
+    return True
 
 
 def update_record(record_id, farmer, district, field, rice, method, date_start, officer):
     """แก้ไขข้อมูลพื้นฐานของแปลง คืนค่า 'ok' หรือ 'duplicate'"""
     sow_date_str = date_start.strftime("%Y-%m-%d")
     officer_str = officer.strip() if officer and officer.strip() else "ไม่ระบุ"
+    record_id = int(_plain(record_id))
+    if USE_SHEETS:
+        result = _sheets_update_record(record_id, farmer, district, field, rice, method,
+                                       sow_date_str, officer_str)
+        clear_data_cache()
+        return result
     with db() as conn:
         dup = conn.execute(
             """SELECT id FROM rice_records
@@ -353,7 +852,8 @@ def update_record(record_id, farmer, district, field, rice, method, date_start, 
                WHERE id = ?""",
             (farmer, district, field, rice, method, sow_date_str, officer_str, now_str(), record_id),
         )
-        return "ok"
+    clear_data_cache()
+    return "ok"
 
 
 def add_inspection(record_id, officer, activity, note, has_issue):
@@ -362,6 +862,11 @@ def add_inspection(record_id, officer, activity, note, has_issue):
     text = f"{prefix}{note}".strip()
     ts = now_str()
     officer_str = officer.strip() if officer and officer.strip() else "ไม่ระบุ"
+    record_id = int(_plain(record_id))
+    if USE_SHEETS:
+        _sheets_add_inspection(record_id, officer_str, activity, note, has_issue, text, ts)
+        clear_data_cache()
+        return
     with db() as conn:
         conn.execute(
             """INSERT INTO inspections (record_id, inspected_at, officer, activity, note, has_issue)
@@ -374,61 +879,107 @@ def add_inspection(record_id, officer, activity, note, has_issue):
                WHERE id = ?""",
             (text if has_issue else "ปกติ", 1 if has_issue else 0, officer_str, ts, record_id),
         )
+    clear_data_cache()
 
 
-def get_inspections(record_id, limit=10):
+@cached_read
+def _read_inspections(record_id, limit):
+    if USE_SHEETS:
+        return _sheets_inspections(record_id, limit)
     with db() as conn:
-        return pd.read_sql_query(
+        return query_df(
+            conn,
             """SELECT inspected_at AS "วันที่ตรวจ", officer AS "ผู้ตรวจ",
                       activity AS "กิจกรรม", note AS "รายละเอียด", has_issue
                FROM inspections WHERE record_id = ? ORDER BY id DESC LIMIT ?""",
-            conn, params=(record_id, limit),
+            (record_id, limit),
         )
 
 
+def get_inspections(record_id, limit=10):
+    return _read_inspections(int(_plain(record_id)), int(limit))
+
+
 def add_shift_event(record_id, activity, days):
+    record_id = int(_plain(record_id))
+    if USE_SHEETS:
+        _sheets_add_shift(record_id, activity, int(days), now_str())
+        clear_data_cache()
+        return
     with db() as conn:
         conn.execute(
             "INSERT INTO schedule_shifts (record_id, activity, days, created_at) VALUES (?, ?, ?, ?)",
             (record_id, activity, int(days), now_str()),
         )
         conn.execute("UPDATE rice_records SET updated_at = ? WHERE id = ?", (now_str(), record_id))
+    clear_data_cache()
 
 
 def delete_shift_event(event_id):
+    event_id = int(_plain(event_id))
+    if USE_SHEETS:
+        _sheets_delete_shift(event_id)
+        clear_data_cache()
+        return
     with db() as conn:
         conn.execute("DELETE FROM schedule_shifts WHERE id = ?", (event_id,))
+    clear_data_cache()
+
+
+@cached_read
+def _read_shift_events(record_id):
+    if USE_SHEETS:
+        mine = sorted((s for s in _sheets_snapshot()["schedule_shifts"] if s["record_id"] == record_id),
+                      key=lambda s: s["id"])
+        return [(s["id"], s["activity"], s["days"], s["created_at"]) for s in mine]
+    with db() as conn:
+        rows = conn.execute(
+            "SELECT id, activity, days, created_at FROM schedule_shifts WHERE record_id = ? ORDER BY id",
+            (record_id,),
+        ).fetchall()
+    return [tuple(r) for r in rows]
 
 
 def get_shift_events(record_id):
     """คืนรายการ (id, activity, days, created_at) เรียงตามลำดับที่บันทึก"""
-    with db() as conn:
-        return conn.execute(
-            "SELECT id, activity, days, created_at FROM schedule_shifts WHERE record_id = ? ORDER BY id",
-            (record_id,),
-        ).fetchall()
+    return _read_shift_events(int(_plain(record_id)))
 
 
+@cached_read
 def load_shift_events():
     """คืน dict: record_id -> [(activity, days), ...] สำหรับทุกแปลง"""
     events = {}
+    if USE_SHEETS:
+        for s in sorted(_sheets_snapshot()["schedule_shifts"], key=lambda s: s["id"]):
+            events.setdefault(s["record_id"], []).append((s["activity"], s["days"]))
+        return events
     with db() as conn:
         for rid, act, days in conn.execute(
             "SELECT record_id, activity, days FROM schedule_shifts ORDER BY id"
         ).fetchall():
-            events.setdefault(rid, []).append((act, days))
+            events.setdefault(int(rid), []).append((act, int(days)))
     return events
 
 
 def delete_field_record(record_id):
+    record_id = int(_plain(record_id))
+    if USE_SHEETS:
+        _sheets_delete_record(record_id)
+        clear_data_cache()
+        return True
     with db() as conn:
         conn.execute("DELETE FROM schedule_shifts WHERE record_id = ?", (record_id,))
         conn.execute("DELETE FROM inspections WHERE record_id = ?", (record_id,))
         conn.execute("DELETE FROM rice_records WHERE id = ?", (record_id,))
+    clear_data_cache()
     return True
 
 
+@cached_read
 def officer_names():
+    if USE_SHEETS:
+        names = {r["officer_in_charge"].strip() for r in _sheets_snapshot()["rice_records"]}
+        return sorted(n for n in names if n and n != "ไม่ระบุ")
     with db() as conn:
         rows = conn.execute(
             """SELECT DISTINCT officer_in_charge FROM rice_records
@@ -439,9 +990,12 @@ def officer_names():
     return [r[0] for r in rows]
 
 
+@cached_read
 def load_db():
+    if USE_SHEETS:
+        return _sheets_load_db()
     with db() as conn:
-        query = """
+        return query_df(conn, """
             SELECT
                 r.id,
                 r.farmer_name AS "ชื่อเกษตรกร",
@@ -467,8 +1021,227 @@ def load_db():
                 GROUP BY record_id
             ) s ON s.record_id = r.id
             ORDER BY r.id
-        """
-        return pd.read_sql_query(query, conn)
+        """)
+
+
+# ---------------------------------------------------------
+# 2D. สำรองและนำเข้าข้อมูล (ไฟล์สำรองเป็น SQLite ใช้ได้กับทุกที่เก็บข้อมูล)
+# ---------------------------------------------------------
+BACKUP_TABLES = ("rice_records", "schedule_shifts", "inspections")
+
+
+def _export_tables():
+    """ข้อมูลสดของทั้ง 3 ตาราง เป็น dict ของ DataFrame"""
+    if USE_SHEETS:
+        tables, _ = _sheets_fetch(BACKUP_TABLES)
+        return {
+            t: pd.DataFrame(
+                [{c: r[c] for c in SHEET_TABS[t]} for r in sorted(tables[t], key=lambda x: x["id"])],
+                columns=SHEET_TABS[t],
+            )
+            for t in BACKUP_TABLES
+        }
+    with db() as conn:
+        return {t: query_df(conn, f"SELECT * FROM {t} ORDER BY id") for t in BACKUP_TABLES}
+
+
+def export_sqlite_backup():
+    """สร้างไฟล์สำรอง (.db แบบ SQLite) จากข้อมูลปัจจุบัน คืนค่าเป็น bytes"""
+    import tempfile
+
+    tables = _export_tables()
+    tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+    tmp.close()
+    dst = sqlite3.connect(tmp.name)
+    try:
+        for table, df in tables.items():
+            df.to_sql(table, dst, index=False, if_exists="replace")
+        dst.commit()
+    finally:
+        dst.close()
+    try:
+        with open(tmp.name, "rb") as f:
+            return f.read()
+    finally:
+        os.remove(tmp.name)
+
+
+def parse_backup(data):
+    """
+    อ่านไฟล์สำรอง SQLite (รวมไฟล์ rice_records.db รุ่นเก่า) แล้วแปลงเป็นรายการแปลงพร้อมประวัติเลื่อน/ตรวจ
+    คืนค่า (records, invalid) โดย invalid คือจำนวนแถวที่ข้อมูลหลักไม่ครบและถูกข้าม
+    """
+    import tempfile
+
+    tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+    tmp.write(data)
+    tmp.close()
+    records, invalid = [], 0
+    try:
+        src = sqlite3.connect(tmp.name)
+        src.row_factory = sqlite3.Row
+        try:
+            tables = {r[0] for r in src.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+            if "rice_records" not in tables:
+                raise ValueError("ไม่พบตาราง rice_records ในไฟล์นี้ (ไม่ใช่ไฟล์สำรองของระบบ)")
+            rows = src.execute("SELECT * FROM rice_records ORDER BY id").fetchall()
+            shifts_by, insp_by = {}, {}
+            if "schedule_shifts" in tables:
+                for r in src.execute("SELECT * FROM schedule_shifts ORDER BY id"):
+                    shifts_by.setdefault(r["record_id"], []).append(r)
+            if "inspections" in tables:
+                for r in src.execute("SELECT * FROM inspections ORDER BY id"):
+                    insp_by.setdefault(r["record_id"], []).append(r)
+
+            def g(row, name, default=None):
+                return row[name] if name in row.keys() and row[name] is not None else default
+
+            first_activity = activity_rules["พันธุ์เบา"][0]["activity"]
+            for r in rows:
+                farmer, field, sow = g(r, "farmer_name"), g(r, "field_name"), g(r, "sow_date")
+                if not farmer or not field or not sow:
+                    invalid += 1
+                    continue
+                status = str(g(r, "status", "ปกติ"))
+                if "has_issue" in r.keys() and r["has_issue"] is not None:
+                    has_issue = int(r["has_issue"])
+                else:
+                    has_issue = 0 if status.strip() in ("", "ปกติ", "None") else 1
+                created = str(g(r, "created_at", now_str()))
+                shifts = [
+                    {"activity": s["activity"], "days": int(s["days"]),
+                     "created_at": str(g(s, "created_at", now_str()))}
+                    for s in shifts_by.get(r["id"], [])
+                ]
+                legacy = int(g(r, "accumulated_shift", 0) or 0)
+                if not shifts and legacy != 0:  # ไฟล์รุ่นเก่าที่เก็บเป็นตัวเลขรวม
+                    act = g(r, "last_delayed_activity", "ไม่มี")
+                    shifts.append({"activity": first_activity if act in ("", "ไม่มี") else act,
+                                   "days": legacy, "created_at": created})
+                records.append({
+                    "farmer_name": str(farmer), "field_name": str(field), "sow_date": str(sow),
+                    "district": str(g(r, "district", "เมืองฉะเชิงเทรา")),
+                    "rice_species": str(g(r, "rice_species", "")),
+                    "planting_method": str(g(r, "planting_method", planting_methods[0])),
+                    "officer_in_charge": str(g(r, "officer_in_charge", "ไม่ระบุ")),
+                    "created_at": created, "status": status, "has_issue": has_issue,
+                    "updated_at": str(g(r, "updated_at", created)),
+                    "shifts": shifts,
+                    "inspections": [
+                        {"inspected_at": str(g(i, "inspected_at", now_str())),
+                         "officer": str(g(i, "officer", "ไม่ระบุ")),
+                         "activity": str(g(i, "activity", "")), "note": str(g(i, "note", "")),
+                         "has_issue": int(g(i, "has_issue", 0))}
+                        for i in insp_by.get(r["id"], [])
+                    ],
+                })
+        finally:
+            src.close()
+    finally:
+        os.remove(tmp.name)
+    return records, invalid
+
+
+def _apply_backup_sql(records):
+    result = {"records": 0, "duplicates": 0, "shifts": 0, "inspections": 0}
+    with db() as conn:
+        for rec in records:
+            key = (rec["farmer_name"], rec["field_name"], rec["sow_date"])
+            if conn.execute(
+                "SELECT id FROM rice_records WHERE farmer_name = ? AND field_name = ? AND sow_date = ?",
+                key,
+            ).fetchone():
+                result["duplicates"] += 1
+                continue
+            conn.execute(
+                """INSERT INTO rice_records (
+                       farmer_name, district, field_name, rice_species, planting_method,
+                       sow_date, officer_in_charge, created_at, status, has_issue, updated_at
+                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (rec["farmer_name"], rec["district"], rec["field_name"], rec["rice_species"],
+                 rec["planting_method"], rec["sow_date"], rec["officer_in_charge"],
+                 rec["created_at"], rec["status"], rec["has_issue"], rec["updated_at"]),
+            )
+            new_id = conn.execute(
+                "SELECT id FROM rice_records WHERE farmer_name = ? AND field_name = ? AND sow_date = ?",
+                key,
+            ).fetchone()[0]
+            result["records"] += 1
+            for s in rec["shifts"]:
+                conn.execute(
+                    "INSERT INTO schedule_shifts (record_id, activity, days, created_at) VALUES (?, ?, ?, ?)",
+                    (new_id, s["activity"], s["days"], s["created_at"]),
+                )
+                result["shifts"] += 1
+            for i in rec["inspections"]:
+                conn.execute(
+                    """INSERT INTO inspections (record_id, inspected_at, officer, activity, note, has_issue)
+                       VALUES (?, ?, ?, ?, ?, ?)""",
+                    (new_id, i["inspected_at"], i["officer"], i["activity"], i["note"], i["has_issue"]),
+                )
+                result["inspections"] += 1
+    return result
+
+
+def _apply_backup_sheets(records):
+    result = {"records": 0, "duplicates": 0, "shifts": 0, "inspections": 0}
+    with get_write_lock():
+        tables, nxt = _sheets_fetch(BACKUP_TABLES)
+        existing = {(r["farmer_name"], r["field_name"], r["sow_date"]) for r in tables["rice_records"]}
+        next_rec = _next_id(tables["rice_records"])
+        next_shift = _next_id(tables["schedule_shifts"])
+        next_insp = _next_id(tables["inspections"])
+        rec_rows, shift_rows, insp_rows = [], [], []
+        for rec in records:
+            key = (rec["farmer_name"], rec["field_name"], rec["sow_date"])
+            if key in existing:
+                result["duplicates"] += 1
+                continue
+            existing.add(key)
+            rid = next_rec
+            next_rec += 1
+            rec_rows.append(_sheet_row_values("rice_records", {
+                "id": rid, "farmer_name": rec["farmer_name"], "district": rec["district"],
+                "field_name": rec["field_name"], "rice_species": rec["rice_species"],
+                "planting_method": rec["planting_method"], "sow_date": rec["sow_date"],
+                "officer_in_charge": rec["officer_in_charge"], "created_at": rec["created_at"],
+                "status": rec["status"], "has_issue": rec["has_issue"], "updated_at": rec["updated_at"],
+            }))
+            result["records"] += 1
+            for s in rec["shifts"]:
+                shift_rows.append(_sheet_row_values("schedule_shifts", {
+                    "id": next_shift, "record_id": rid, "activity": s["activity"],
+                    "days": s["days"], "created_at": s["created_at"]}))
+                next_shift += 1
+                result["shifts"] += 1
+            for i in rec["inspections"]:
+                insp_rows.append(_sheet_row_values("inspections", {
+                    "id": next_insp, "record_id": rid, "inspected_at": i["inspected_at"],
+                    "officer": i["officer"], "activity": i["activity"], "note": i["note"],
+                    "has_issue": i["has_issue"]}))
+                next_insp += 1
+                result["inspections"] += 1
+        items = []
+        for title, rows in (("rice_records", rec_rows), ("schedule_shifts", shift_rows),
+                            ("inspections", insp_rows)):
+            if rows:
+                first = nxt[title]
+                items.append({"range": _sheet_range(title, first, first + len(rows) - 1), "values": rows})
+        get_sheets_client(SHEET_ID).batch_put(items)
+    return result
+
+
+def import_sqlite_backup(data):
+    """
+    นำเข้าข้อมูลจากไฟล์สำรอง เพิ่มเข้าที่เก็บข้อมูลปัจจุบัน
+    - แปลงที่ซ้ำ (ชื่อเกษตรกร + ชื่อแปลง + วันหว่าน) จะถูกข้าม ไม่ทับข้อมูลเดิม
+    - id ถูกสร้างใหม่ และโยงประวัติการเลื่อน/การตรวจไปยัง id ใหม่ให้
+    """
+    records, invalid = parse_backup(data)
+    result = _apply_backup_sheets(records) if USE_SHEETS else _apply_backup_sql(records)
+    result["invalid"] = invalid
+    clear_data_cache()
+    return result
 
 
 # ---------------------------------------------------------
@@ -1202,7 +1975,6 @@ with tab4:
                 f"**(อำเภอ: {row['อำเภอ']} | ผู้รับผิดชอบ: {row['ผู้รับผิดชอบแปลง']} | "
                 f"วันที่หว่าน: {row['วันที่เริ่มเพาะปลูก']} | อายุข้าว: {current_rice_age})**"
             )
-            
             rice_warnings(row["สายพันธุ์ข้าว"], row["วิธีการปลูก"])
             sched_p = get_rice_schedule(sow_p, row["สายพันธุ์ข้าว"], district_name=row["อำเภอ"], events=events_p)
             st.dataframe(style_schedule(sched_p), hide_index=True, **STRETCH)
@@ -1246,13 +2018,50 @@ with tab4:
                     flash("success", f"ลบแปลงของ {row['ชื่อเกษตรกร']} แล้ว")
                     st.rerun()
 
-                if os.path.exists(DB_FILE):
-                    with open(DB_FILE, "rb") as f:
-                        st.download_button("💽 สำรองฐานข้อมูล (.db)", f.read(),
-                                           file_name=f"rice_records_backup_{today():%Y%m%d}.db")
+
+# --- ฐานข้อมูล: สำรอง / นำเข้า และสถานะแหล่งข้อมูล ---
+st.divider()
+if not USE_PG and not USE_SHEETS and ON_CLOUD:
+    st.warning(
+        "⚠️ ตอนนี้แอปใช้ SQLite บนเซิร์ฟเวอร์ชั่วคราว ข้อมูลอาจหายเมื่อแอปรีสตาร์ตหรืออัปโหลดโค้ดใหม่ "
+        "ให้ตั้งค่า GSHEET_ID (Google Sheets) ใน Secrets หรือกดสำรองข้อมูลเก็บไว้เป็นระยะ"
+    )
+with st.expander("🗄️ ฐานข้อมูล: สำรองและนำเข้าข้อมูล"):
+    st.caption(f"ที่เก็บข้อมูลที่ใช้อยู่: {DB_LABEL}")
+    if USE_SHEETS:
+        st.markdown(f"📄 [เปิดสเปรดชีตข้อมูล](https://docs.google.com/spreadsheets/d/{SHEET_ID})")
+        st.caption(
+            "แก้ค่าในชีตได้ แอปจะเห็นภายใน 1 นาที แต่ห้ามแก้หัวตาราง (แถวที่ 1) เปลี่ยนชื่อแท็บ "
+            "หรือเพิ่มแถวเอง ให้เพิ่มข้อมูลผ่านแอป"
+        )
+    col_backup, col_import = st.columns(2)
+    with col_backup:
+        st.markdown("**สำรองข้อมูล**")
+        if st.button("💽 เตรียมไฟล์สำรองข้อมูล", key="prep_backup"):
+            st.session_state["backup_bytes"] = export_sqlite_backup()
+        if st.session_state.get("backup_bytes"):
+            st.download_button(
+                "⬇️ ดาวน์โหลดไฟล์สำรอง (.db)", st.session_state["backup_bytes"],
+                file_name=f"rice_records_backup_{today():%Y%m%d}.db", key="dl_backup",
+            )
+    with col_import:
+        st.markdown("**นำเข้าจากไฟล์สำรอง (.db)**")
+        st.caption("เพิ่มข้อมูลเข้าฐานข้อมูลปัจจุบัน แปลงที่ซ้ำ (ชื่อเกษตรกร + ชื่อแปลง + วันหว่าน) จะถูกข้าม")
+        uploaded = st.file_uploader("เลือกไฟล์ .db", type=["db", "sqlite", "sqlite3"], key="import_db")
+        if uploaded is not None and st.button("⬆️ นำเข้าข้อมูล", key="do_import"):
+            try:
+                res = import_sqlite_backup(uploaded.getvalue())
+                flash(
+                    "success",
+                    f"✅ นำเข้าแล้ว: แปลงใหม่ {res['records']} แปลง (ข้ามที่ซ้ำ {res['duplicates']}) "
+                    f"ประวัติเลื่อน {res['shifts']} รายการ ประวัติตรวจ {res['inspections']} รายการ"
+                    + (f" (ข้ามแถวที่ข้อมูลไม่ครบ {res['invalid']})" if res.get("invalid") else ""),
+                )
+                st.rerun()
+            except Exception as exc:
+                st.error(f"❌ นำเข้าไม่สำเร็จ: {type(exc).__name__}: {exc}")
 
 # --- สถานะและเครดิตแหล่งข้อมูลพยากรณ์อากาศ ---
-st.divider()
 weather_err = st.session_state.get("_weather_err")
 if weather_err:
     st.warning(f"⚠️ ดึงพยากรณ์อากาศไม่สำเร็จ ({weather_err}) ระบบจึงใช้สถิติรายเดือนแทน")
