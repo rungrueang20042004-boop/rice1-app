@@ -761,13 +761,21 @@ def _init_sql():
 
 
 @st.cache_resource(show_spinner=False)
-def init_db():
-    """เตรียมที่เก็บข้อมูลครั้งเดียวต่อการรันแอป (ถ้าเชื่อมต่อไม่ได้จะ raise ให้ผู้เรียกแสดงข้อความ)"""
+def _init_db(_target_key):
+    """
+    เตรียมที่เก็บข้อมูล คีย์แคชผูกกับปลายทางปัจจุบัน (SHEET_ID / DATABASE_URL / DB_FILE)
+    เพื่อให้การเปลี่ยนค่าใน Secrets (เช่น สลับจาก Postgres ไป Sheets) บังคับให้ต่อใหม่
+    โดยอัตโนมัติในรันถัดไป แทนที่จะใช้ผลแคชเดิมของปลายทางก่อนหน้าซึ่งอาจไม่มีตารางเป้าหมายอยู่จริง
+    """
     if USE_SHEETS:
         _init_sheets()
     else:
         _init_sql()
     return True
+
+
+def init_db():
+    return _init_db(SHEET_ID if USE_SHEETS else (DATABASE_URL if USE_PG else DB_FILE))
 
 
 def _describe_storage_error(exc):
@@ -780,6 +788,10 @@ def _describe_storage_error(exc):
                         "service account เป็น Editor")
             if "HTTP 404" in text:
                 return f"{text} — ตรวจว่า GSHEET_ID ถูกต้อง"
+            if "Unable to parse range" in text:
+                return (f"{text} — ไม่พบแท็บที่ระบบต้องการในสเปรดชีตนี้ "
+                        "(อาจมีคนลบ/เปลี่ยนชื่อแท็บ rice_records, schedule_shifts หรือ inspections "
+                        "หรือเพิ่งเปลี่ยน GSHEET_ID/DATABASE_URL ใน Secrets — ลอง Reboot app ในเมนู Manage app)")
             return text
         if isinstance(exc, RuntimeError):
             return text
