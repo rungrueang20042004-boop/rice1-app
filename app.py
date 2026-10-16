@@ -187,7 +187,9 @@ def load_rice_catalog(path):
 rice_catalog, PHOTOPERIOD_SENSITIVE = load_rice_catalog(CATALOG_FILE)
 
 # ระบบรองรับเฉพาะนาหว่าน เพราะตารางกิจกรรมนับจากวันหว่าน (ยังไม่มีตารางสำหรับนาดำ)
-planting_methods = ["หว่านน้ำตม", "หว่านแห้ง / หว่านสำรวย"]
+planting_methods = ["นาหว่าน"]
+# ชื่อวิธีปลูกแบบเดิมที่อาจยังอยู่ในข้อมูลเก่า ให้ถือเป็น "นาหว่าน" เมื่อแก้ไขแปลง
+LEGACY_BROADCAST = {"หว่านน้ำตม", "หว่านแห้ง / หว่านสำรวย"}
 
 activity_rules = {
     "พันธุ์เบา": [
@@ -2016,11 +2018,14 @@ with tab4:
                         "สายพันธุ์ข้าว", r_list,
                         index=r_list.index(row["สายพันธุ์ข้าว"]) if row["สายพันธุ์ข้าว"] in r_list else 0)
                     m_list = list(planting_methods)
-                    if row["วิธีการปลูก"] and row["วิธีการปลูก"] not in m_list:  # แปลงเก่าที่บันทึกเป็นปักดำ: คงค่าเดิมไว้ ไม่เปลี่ยนโดยไม่ตั้งใจ
-                        m_list = [row["วิธีการปลูก"]] + m_list
+                    cur_method = row["วิธีการปลูก"]
+                    if cur_method in LEGACY_BROADCAST:  # ชื่อเดิมของนาหว่าน: บันทึกแล้วจะเปลี่ยนเป็น "นาหว่าน"
+                        cur_method = "นาหว่าน"
+                    if cur_method and cur_method not in m_list:  # แปลงเก่าที่บันทึกเป็นปักดำ: คงค่าเดิมไว้ ไม่เปลี่ยนโดยไม่ตั้งใจ
+                        m_list = [cur_method] + m_list
                     e_method = st.selectbox(
                         "วิธีการปลูก", m_list,
-                        index=m_list.index(row["วิธีการปลูก"]) if row["วิธีการปลูก"] in m_list else 0)
+                        index=m_list.index(cur_method) if cur_method in m_list else 0)
                     e_sow = st.date_input("วันที่เริ่มเพาะปลูก", value=sow_p)
                     e_officer = st.text_input("ผู้รับผิดชอบแปลง", value=row["ผู้รับผิดชอบแปลง"] or "")
                     submitted = st.form_submit_button("💾 บันทึกการแก้ไข", type="primary")
