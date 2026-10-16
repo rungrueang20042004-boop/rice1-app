@@ -1,3 +1,4 @@
+import base64
 import contextlib
 import datetime
 import hmac
@@ -26,9 +27,24 @@ except Exception:  # เช่น Windows ที่ไม่มี tzdata
 APP_TITLE = "ระบบปฏิทินนาข้าวและแดชบอร์ดวางแผนตรวจแปลง"
 APP_SUBTITLE = "เครื่องมือส่วนกลางสำหรับเจ้าหน้าที่และที่ปรึกษาทางการเกษตรประจำแผนก"
 
+# โลโก้บริษัท: วางไฟล์ไว้ที่ assets/chiatai_logo.png (ถ้าไม่มีไฟล์ แอปยังทำงานได้ตามปกติ แค่ไม่แสดงโลโก้)
+try:
+    _APP_DIR = os.path.dirname(os.path.abspath(__file__))
+except NameError:
+    _APP_DIR = os.getcwd()
+LOGO_FILE = os.path.join(_APP_DIR, "assets", "chiatai_logo.png")
+HAS_LOGO = os.path.exists(LOGO_FILE)
+
+
+def logo_data_uri():
+    """อ่านโลโก้เป็น base64 เพื่อฝังลงใน HTML ของแถบหัว"""
+    with open(LOGO_FILE, "rb") as f:
+        return "data:image/png;base64," + base64.b64encode(f.read()).decode()
+
+
 st.set_page_config(
     page_title=APP_TITLE,
-    page_icon="🌾",
+    page_icon=LOGO_FILE if HAS_LOGO else "🌾",
     layout="wide",
 )
 
@@ -55,10 +71,18 @@ h1, h2, h3, h4 {{ color: {GREEN}; }}
 /* แถบหัวของแอป */
 .app-header {{
     background: {GREEN}; border-bottom: 4px solid {GOLD};
-    border-radius: 10px; padding: 1rem 1.25rem; margin-bottom: 1rem; text-align: center;
+    border-radius: 10px; padding: 1rem 1.25rem; margin-bottom: 1rem;
+    display: flex; align-items: center; justify-content: center; gap: 1.25rem;
 }}
+.app-header img {{ height: 72px; width: auto; flex-shrink: 0; }}
+.app-header .app-header-text {{ text-align: center; }}
 .app-header h1 {{ color: {CREAM}; margin: 0; padding: 0; font-size: 1.9rem; }}
 .app-header p {{ color: {GOLD_LIGHT}; margin: .25rem 0 0; }}
+@media (max-width: 640px) {{
+    .app-header {{ flex-direction: column; gap: .5rem; }}
+    .app-header img {{ height: 56px; }}
+    .app-header h1 {{ font-size: 1.4rem; }}
+}}
 
 /* แท็บ */
 .stTabs [data-baseweb="tab"] {{ color: {TEXT}; }}
@@ -1661,7 +1685,10 @@ def rice_warnings(rice_name, method):
 # 4. ส่วนติดต่อผู้ใช้ (4 แท็บ)
 # ---------------------------------------------------------
 st.markdown(
-    f"<div class='app-header'><h1>🌾 {APP_TITLE}</h1><p>{APP_SUBTITLE}</p></div>",
+    "<div class='app-header'>"
+    + (f"<img src='{logo_data_uri()}' alt='CHIA TAI'>" if HAS_LOGO else "")
+    + f"<div class='app-header-text'><h1>{'' if HAS_LOGO else '🌾 '}{APP_TITLE}</h1>"
+    + f"<p>{APP_SUBTITLE}</p></div></div>",
     unsafe_allow_html=True,
 )
 show_flash()
