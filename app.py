@@ -22,11 +22,85 @@ except Exception:  # เช่น Windows ที่ไม่มี tzdata
 # ---------------------------------------------------------
 # 0. การตั้งค่าทั่วไป
 # ---------------------------------------------------------
+# ชื่อระบบ: แก้ที่นี่ที่เดียว จะเปลี่ยนทั้งชื่อบนแท็บเบราว์เซอร์และหัวข้อบนหน้าเว็บ
+APP_TITLE = "ระบบปฏิทินนาข้าวและแดชบอร์ดวางแผนตรวจแปลง"
+APP_SUBTITLE = "เครื่องมือส่วนกลางสำหรับเจ้าหน้าที่และที่ปรึกษาทางการเกษตรประจำแผนก"
+
 st.set_page_config(
-    page_title="ระบบปฏิทินนาข้าวและแดชบอร์ดวางแผนตรวจแปลง",
+    page_title=APP_TITLE,
     page_icon="🌾",
     layout="wide",
 )
+
+# ---------------------------------------------------------
+# ธีมสี เขียว-ทอง (สีประจำบริษัทเจียไต๋)
+# แก้รหัสสีที่ตัวแปรด้านล่างที่เดียว จะเปลี่ยนทั้งแอป
+# ---------------------------------------------------------
+GREEN = "#1B5E20"        # เขียวหลัก: หัวข้อ แถบหัว ขอบ
+GREEN_2 = "#388E3C"      # เขียวรอง: hover
+GREEN_LIGHT = "#E8F0E3"  # เขียวอ่อน: พื้นหลังรอง
+GOLD = "#C9A227"         # ทอง: ปุ่มหลัก เส้นเน้น
+GOLD_DARK = "#B08D1E"    # ทองเข้ม: ปุ่มหลักตอน hover
+GOLD_TEXT = "#3A2E05"    # ตัวอักษรบนพื้นทอง
+GOLD_LIGHT = "#F5E7B8"   # ทองอ่อน
+CREAM = "#FAF7EC"        # พื้นหลังหน้า
+TEXT = "#212121"         # ตัวอักษรหลัก
+
+st.markdown(f"""
+<style>
+/* พื้นหลังและตัวอักษร */
+.stApp {{ background-color: {CREAM}; color: {TEXT}; }}
+h1, h2, h3, h4 {{ color: {GREEN}; }}
+
+/* แถบหัวของแอป */
+.app-header {{
+    background: {GREEN}; border-bottom: 4px solid {GOLD};
+    border-radius: 10px; padding: 1rem 1.25rem; margin-bottom: 1rem; text-align: center;
+}}
+.app-header h1 {{ color: {CREAM}; margin: 0; padding: 0; font-size: 1.9rem; }}
+.app-header p {{ color: {GOLD_LIGHT}; margin: .25rem 0 0; }}
+
+/* แท็บ */
+.stTabs [data-baseweb="tab"] {{ color: {TEXT}; }}
+.stTabs [aria-selected="true"] {{ color: {GREEN}; font-weight: 600; }}
+.stTabs [data-baseweb="tab-highlight"] {{ background-color: {GOLD}; }}
+
+/* ปุ่มทั่วไป */
+.stButton > button, .stDownloadButton > button, .stFormSubmitButton > button {{
+    border: 1px solid {GREEN}; color: {GREEN}; background: #FFFFFF;
+}}
+.stButton > button:hover, .stDownloadButton > button:hover, .stFormSubmitButton > button:hover {{
+    background: {GREEN_LIGHT}; border-color: {GREEN_2}; color: {GREEN};
+}}
+/* ปุ่มหลัก (type="primary") เป็นสีทอง */
+.stButton > button[kind="primary"], .stFormSubmitButton > button[kind="primaryFormSubmit"] {{
+    background-color: {GOLD}; color: {GOLD_TEXT}; border: none;
+}}
+.stButton > button[kind="primary"]:hover, .stFormSubmitButton > button[kind="primaryFormSubmit"]:hover {{
+    background-color: {GOLD_DARK}; color: {GOLD_TEXT};
+}}
+.stButton > button:disabled {{ opacity: .45; }}
+
+/* ช่องกรอก / dropdown */
+.stTextInput input, .stNumberInput input, .stDateInput input, .stTextArea textarea,
+.stSelectbox div[data-baseweb="select"] > div {{
+    background-color: #FFFFFF; border-color: #C8D6C0;
+}}
+
+/* การ์ดตัวเลข (st.metric) */
+[data-testid="stMetric"] {{
+    background: #FFFFFF; border-left: 4px solid {GREEN}; padding: .6rem .9rem;
+}}
+[data-testid="stMetricValue"] {{ color: {GREEN}; }}
+
+/* กล่องที่มีขอบ (การ์ดเกษตรกร) และ expander */
+[data-testid="stVerticalBlockBorderWrapper"] {{ background: #FFFFFF; }}
+[data-testid="stExpander"] details {{ background: #FFFFFF; border-color: #C8D6C0; }}
+
+/* เส้นคั่น */
+hr {{ border-color: {GOLD_LIGHT}; }}
+</style>
+""", unsafe_allow_html=True)
 
 # ตั้ง path ของไฟล์ฐานข้อมูลผ่าน environment variable ได้ (ชี้ไปยังดิสก์ถาวรเมื่อ deploy)
 DB_FILE = os.environ.get("RICE_DB_PATH", "rice_records.db")
@@ -1523,12 +1597,12 @@ def get_rice_schedule(sow_date, rice_name, district_name="เมืองฉะ�
 
 
 def style_schedule(df):
-    """ไฮไลต์: แดง = ฝนมากในวันพ่นยา, เหลือง = กิจกรรมที่ถูกเลื่อน"""
+    """ไฮไลต์: แดง = ฝนมากในวันพ่นยา, ทองอ่อน = กิจกรรมที่ถูกเลื่อน"""
     def _highlight(row):
         if df.loc[row.name, "_danger"]:
-            css = "background-color: #ffebee; font-weight: bold"
+            css = "background-color: #FDE7E7; color: #B71C1C; font-weight: bold"
         elif df.loc[row.name, "_shifted"]:
-            css = "background-color: #fff9c4; font-weight: bold"
+            css = "background-color: #FFF4D6; color: #8A5A00; font-weight: bold"
         else:
             css = ""
         return [css] * len(row)
@@ -1587,11 +1661,7 @@ def rice_warnings(rice_name, method):
 # 4. ส่วนติดต่อผู้ใช้ (4 แท็บ)
 # ---------------------------------------------------------
 st.markdown(
-    "<h1 style='text-align: center; color: #1e7e34;'>🌾 ระบบสนับสนุนการตัดสินใจและวางแผนตรวจเยี่ยมแปลงนา จ.ฉะเชิงเทรา</h1>",
-    unsafe_allow_html=True,
-)
-st.markdown(
-    "<p style='text-align: center; color: #555;'>เครื่องมือส่วนกลางสำหรับเจ้าหน้าที่และที่ปรึกษาทางการเกษตรประจำแผนก</p>",
+    f"<div class='app-header'><h1>🌾 {APP_TITLE}</h1><p>{APP_SUBTITLE}</p></div>",
     unsafe_allow_html=True,
 )
 show_flash()
@@ -1949,12 +2019,12 @@ with tab4:
                         st.write(f"**จำนวนแปลง:** {len(group)} แปลง")
                         if issue_count > 0:
                             st.markdown(
-                                f"<div style='background-color: #fee2e2; color: #b91c1c; padding: 4px 8px; border-radius: 6px; display: inline-block; font-size: 14px; font-weight: bold;'>⚠️ พบปัญหา {issue_count} แปลง</div>",
+                                f"<div style='background-color: #FDE7E7; color: #B71C1C; padding: 4px 8px; border-radius: 6px; display: inline-block; font-size: 14px; font-weight: bold;'>⚠️ พบปัญหา {issue_count} แปลง</div>",
                                 unsafe_allow_html=True,
                             )
                         else:
                             st.markdown(
-                                "<div style='background-color: #d1fae5; color: #047857; padding: 4px 8px; border-radius: 6px; display: inline-block; font-size: 14px; font-weight: bold;'>✅ ปกติ</div>",
+                                f"<div style='background-color: {GREEN_LIGHT}; color: {GREEN}; padding: 4px 8px; border-radius: 6px; display: inline-block; font-size: 14px; font-weight: bold;'>✅ ปกติ</div>",
                                 unsafe_allow_html=True,
                             )
                         st.write("")
@@ -1989,7 +2059,7 @@ with tab4:
                 lines = "\n".join(f"- **{act}** → {fmt_days(days)}" for act, days in events_p)
                 st.warning(
                     f"⚠️ **แปลงนี้มีการแจ้งปรับเลื่อนปฏิทิน {len(events_p)} ครั้ง**\n\n{lines}\n\n"
-                    "กิจกรรมตั้งแต่จุดที่เลื่อนเป็นต้นไปถูกปรับวันทำกิจกรรม (ไฮไลต์เหลืองด้านล่าง)"
+                    "กิจกรรมตั้งแต่จุดที่เลื่อนเป็นต้นไปถูกปรับวันทำกิจกรรม (ไฮไลต์สีทองอ่อนด้านล่าง)"
                 )
             else:
                 st.success("✅ **แปลงนี้ดำเนินกิจกรรมตรงตามกำหนดเดิมทุกขั้นตอน (ไม่มีกิจกรรมเลื่อนวัน)**")
