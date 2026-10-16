@@ -186,8 +186,8 @@ def load_rice_catalog(path):
 # PHOTOPERIOD_SENSITIVE: พันธุ์ไวต่อช่วงแสง ออกดอกตามความยาวของวัน ไม่ใช่ตามจำนวนวันหลังหว่าน
 rice_catalog, PHOTOPERIOD_SENSITIVE = load_rice_catalog(CATALOG_FILE)
 
-planting_methods = ["หว่านน้ำตม", "หว่านแห้ง / หว่านสำรวย", "ปักดำ / ดำนา"]
-TRANSPLANT_METHOD = "ปักดำ / ดำนา"
+# ระบบรองรับเฉพาะนาหว่าน เพราะตารางกิจกรรมนับจากวันหว่าน (ยังไม่มีตารางสำหรับนาดำ)
+planting_methods = ["หว่านน้ำตม", "หว่านแห้ง / หว่านสำรวย"]
 
 activity_rules = {
     "พันธุ์เบา": [
@@ -218,9 +218,12 @@ activity_rules = {
     ],
 }
 
+# ร้อยละของวันที่มีฝน (อย่างน้อย 1 มม.) ในแต่ละเดือน ใช้แทนพยากรณ์เมื่อเกินช่วง 14 วัน
+# คำนวณจาก "จำนวนวันที่มีฝนเฉลี่ยรายเดือน" ของอำเภอบ้านโพธิ์ จ.ฉะเชิงเทรา (WeatherSpark, ช่วงปี 1980-2016)
+# หารด้วยจำนวนวันในเดือน: https://weatherspark.com/y/113893/Average-Weather-in-Ban-Pho-Thailand-Year-Round
 chachoengsao_climatology = {
-    1: 10, 2: 15, 3: 25, 4: 40, 5: 60, 6: 55,
-    7: 60, 8: 65, 9: 75, 10: 60, 11: 30, 12: 10,
+    1: 4, 2: 8, 3: 16, 4: 29, 5: 48, 6: 52,
+    7: 52, 8: 59, 9: 68, 10: 51, 11: 16, 12: 3,
 }
 
 # ---------------------------------------------------------
@@ -1400,11 +1403,26 @@ def rain_window(start, end, forecast):
     return days
 
 
+def forecast_confidence(lead_days):
+    """
+    ป้ายระดับความน่าเชื่อถือตามระยะพยากรณ์ล่วงหน้า (ยิ่งไกลยิ่งคลาดเคลื่อนมาก)
+    ใช้เพื่อเตือนผู้ใช้ ไม่ใช่ค่าความแม่นยำที่วัดได้ ปรับช่วงวันได้ที่นี่
+    """
+    if lead_days <= 3:
+        return "ความน่าเชื่อถือ: ค่อนข้างดี"
+    if lead_days <= 7:
+        return "ความน่าเชื่อถือ: ใช้ประกอบ"
+    return "ความน่าเชื่อถือ: แนวโน้มเท่านั้น"
+
+
 def describe_rain(days, district_name):
     pcts = [x[1] for x in days]
     low, high = min(pcts), max(pcts)
     span = f"{low}%" if low == high else f"{low}-{high}%"
     live_count = sum(1 for x in days if x[2])
+    if live_count:
+        lead = (min(x[0] for x in days if x[2]) - today()).days
+        span += f" · {forecast_confidence(lead)}"
     if live_count == len(days):
         if WEATHER_SOURCE == "openmeteo":
             return f"⚡ {span} (พยากรณ์สด อ.{district_name})"
@@ -1416,16 +1434,14 @@ def describe_rain(days, district_name):
 
 def assess_rain(rule, days, n_start, n_end, forecast, district_name):
     """
-    ประเมินฝนตลอดช่วงกิจกรรม คืน (ข้อความสถานะ, คำแนะนำ, ต้องเตือนสีแดงหรือไม่)
-    - ไม่ใช่กิจกรรมพ่นยา: แสดงช่วงโอกาสฝนเฉยๆ
-    - พ่นยา + ฝนมากทุกวันในช่วง: เตือนแดง และแนะนำวันแห้งที่ใกล้ที่สุด
-    - พ่นยา + ฝนมากบางวัน: ไม่เตือนแดง แต่แนะนำวันที่ฝนน้อยที่สุดในช่วง
+    ประเมินฝนตลอดช่วงกิจกรรม (ทุกกิจกรรม เพราะฝนมีผลกับงานในแปลงทุกระยะ)
+    คืน (ข้อความสถานะ, คำแนะนำ, ต้องเตือนสีแดงหรือไม่)
+    - ฝนมากทุกวันในช่วง: เตือนแดง และแนะนำวันแห้งที่ใกล้ที่สุด
+    - ฝนมากบางวัน: ไม่เตือนแดง แต่แนะนำวันที่ฝนน้อยที่สุดในช่วง
     """
     if not days:
         return "⏳ ช่วงกิจกรรมนี้ผ่านมาแล้ว", "-", False
     status = describe_rain(days, district_name)
-    if not rule["is_spray"]:
-        return status, "-", False
 
     rainy = [x for x in days if x[1] > RAIN_LIMIT]
     if not rainy:
@@ -1438,7 +1454,7 @@ def assess_rain(rule, days, n_start, n_end, forecast, district_name):
             if found:
                 advice = f"💡 แนะนำทำวันที่ {found[0].strftime('%d/%m')} (ฝน {found[1]}%)"
             else:
-                advice = "💡 ฝนสูงต่อเนื่อง ควรติดตามพยากรณ์ก่อนพ่นยา"
+                advice = "💡 ฝนสูงต่อเนื่อง ควรติดตามพยากรณ์ก่อนทำกิจกรรม"
         else:
             advice = "💡 ช่วงนี้ฝนชุก ควรติดตามพยากรณ์ใกล้วันทำงาน"
         return status, advice, True
@@ -1558,11 +1574,6 @@ def officer_input(label, key, current=None):
 
 def rice_warnings(rice_name, method):
     """แสดงคำเตือนเมื่อตารางมาตรฐานอาจไม่ตรงกับพันธุ์/วิธีปลูกที่เลือก"""
-    if method == TRANSPLANT_METHOD:
-        st.info(
-            "ℹ️ ตารางกิจกรรมนี้อ้างอิงแบบข้าวหว่าน (เช่น คุมเลน/คุมฆ่า) "
-            "สำหรับข้าวปักดำให้ใช้เป็นแนวทางเบื้องต้น และปรับตามคำแนะนำของเจ้าหน้าที่"
-        )
     if rice_name in PHOTOPERIOD_SENSITIVE:
         st.info(
             "ℹ️ พันธุ์นี้ไวต่อช่วงแสง วันออกดอกและเก็บเกี่ยวขึ้นกับช่วงเวลาของปี "
@@ -2004,9 +2015,12 @@ with tab4:
                     e_rice = st.selectbox(
                         "สายพันธุ์ข้าว", r_list,
                         index=r_list.index(row["สายพันธุ์ข้าว"]) if row["สายพันธุ์ข้าว"] in r_list else 0)
+                    m_list = list(planting_methods)
+                    if row["วิธีการปลูก"] and row["วิธีการปลูก"] not in m_list:  # แปลงเก่าที่บันทึกเป็นปักดำ: คงค่าเดิมไว้ ไม่เปลี่ยนโดยไม่ตั้งใจ
+                        m_list = [row["วิธีการปลูก"]] + m_list
                     e_method = st.selectbox(
-                        "วิธีการปลูก", planting_methods,
-                        index=planting_methods.index(row["วิธีการปลูก"]) if row["วิธีการปลูก"] in planting_methods else 0)
+                        "วิธีการปลูก", m_list,
+                        index=m_list.index(row["วิธีการปลูก"]) if row["วิธีการปลูก"] in m_list else 0)
                     e_sow = st.date_input("วันที่เริ่มเพาะปลูก", value=sow_p)
                     e_officer = st.text_input("ผู้รับผิดชอบแปลง", value=row["ผู้รับผิดชอบแปลง"] or "")
                     submitted = st.form_submit_button("💾 บันทึกการแก้ไข", type="primary")
