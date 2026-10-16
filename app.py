@@ -39,10 +39,10 @@ st.set_page_config(
 GREEN = "#1B5E20"        # เขียวหลัก: หัวข้อ แถบหัว ขอบ
 GREEN_2 = "#388E3C"      # เขียวรอง: hover
 GREEN_LIGHT = "#E8F0E3"  # เขียวอ่อน: พื้นหลังรอง
-GOLD = "#C9A227"         # ทอง: ปุ่มหลัก เส้นเน้น
-GOLD_DARK = "#B08D1E"    # ทองเข้ม: ปุ่มหลักตอน hover
-GOLD_TEXT = "#3A2E05"    # ตัวอักษรบนพื้นทอง
-GOLD_LIGHT = "#F5E7B8"   # ทองอ่อน
+GOLD = "#AC883A"         # ทอง: สีจากโลโก้ CHIA TAI ใช้กับปุ่มหลัก เส้นเน้น
+GOLD_DARK = "#8C6E2E"    # ทองเข้ม: ปุ่มหลักตอน hover
+GOLD_TEXT = "#FFFFFF"    # ตัวอักษรบนพื้นทอง
+GOLD_LIGHT = "#EFE4C9"   # ทองอ่อน
 CREAM = "#FAF7EC"        # พื้นหลังหน้า
 TEXT = "#212121"         # ตัวอักษรหลัก
 
@@ -74,7 +74,7 @@ h1, h2, h3, h4 {{ color: {GREEN}; }}
 }}
 /* ปุ่มหลัก (type="primary") เป็นสีทอง */
 .stButton > button[kind="primary"], .stFormSubmitButton > button[kind="primaryFormSubmit"] {{
-    background-color: {GOLD}; color: {GOLD_TEXT}; border: none;
+    background-color: {GOLD}; color: {GOLD_TEXT}; border: none; font-weight: 600;
 }}
 .stButton > button[kind="primary"]:hover, .stFormSubmitButton > button[kind="primaryFormSubmit"]:hover {{
     background-color: {GOLD_DARK}; color: {GOLD_TEXT};
