@@ -322,12 +322,21 @@ activity_rules = {
     ],
 }
 
-# ร้อยละของวันที่มีฝน (อย่างน้อย 1 มม.) ในแต่ละเดือน ใช้แทนพยากรณ์เมื่อเกินช่วง 14 วัน
-# คำนวณจาก "จำนวนวันที่มีฝนเฉลี่ยรายเดือน" ของอำเภอบ้านโพธิ์ จ.ฉะเชิงเทรา (WeatherSpark, ช่วงปี 1980-2016)
-# หารด้วยจำนวนวันในเดือน: https://weatherspark.com/y/113893/Average-Weather-in-Ban-Pho-Thailand-Year-Round
-chachoengsao_climatology = {
-    1: 4, 2: 8, 3: 16, 4: 29, 5: 48, 6: 52,
-    7: 52, 8: 59, 9: 68, 10: 51, 11: 16, 12: 3,
+# ร้อยละของวันที่มีฝน (อย่างน้อย 1 มม.) ในแต่ละเดือน แยกตามอำเภอ ใช้แทนพยากรณ์เมื่อเกินช่วง 14 วัน
+# คำนวณจาก "จำนวนวันที่มีฝนเฉลี่ยรายเดือน" ของแต่ละพื้นที่ใน WeatherSpark (ช่วงปี 1980-2016) หารด้วยจำนวนวันในเดือน
+# ลำดับค่า: ม.ค. ถึง ธ.ค. ที่มา: https://weatherspark.com/countries/TH/44
+district_climatology = {
+    "เมืองฉะเชิงเทรา": [4, 8, 16, 29, 48, 53, 52, 59, 69, 51, 16, 3],  # weatherspark.com/y/113889
+    "บางคล้า": [4, 8, 16, 30, 49, 54, 53, 60, 69, 50, 15, 2],  # weatherspark.com/y/113897
+    "บางน้ำเปรี้ยว": [4, 7, 15, 29, 48, 53, 53, 61, 69, 50, 15, 3],  # weatherspark.com/y/113896
+    "บางปะกง": [4, 8, 16, 27, 47, 52, 51, 57, 68, 52, 17, 3],  # weatherspark.com/y/113426
+    "บ้านโพธิ์": [4, 8, 16, 29, 48, 52, 52, 59, 68, 51, 16, 3],  # weatherspark.com/y/113893
+    "พนมสารคาม": [4, 8, 16, 31, 51, 55, 54, 62, 69, 49, 15, 2],  # weatherspark.com/y/113885
+    "ราชสาส์น": [4, 8, 16, 31, 50, 54, 53, 61, 69, 49, 14, 2],  # weatherspark.com/y/113892
+    "สนามชัยเขต": [4, 8, 17, 31, 51, 56, 55, 61, 69, 49, 16, 2],  # weatherspark.com/y/113882
+    "แปลงยาว": [5, 8, 16, 30, 50, 54, 53, 59, 68, 50, 16, 3],  # weatherspark.com/y/113883
+    "ท่าตะเกียบ": [4, 10, 18, 31, 54, 59, 56, 62, 69, 51, 17, 3],  # weatherspark.com/y/113902
+    "คลองเขื่อน": [4, 7, 15, 30, 48, 53, 53, 61, 69, 49, 15, 2],  # weatherspark.com/y/113894
 }
 
 # ---------------------------------------------------------
@@ -1476,12 +1485,13 @@ def compute_shifts(rules, events):
     return shifts, origins
 
 
-def rain_for(day, forecast):
+def rain_for(day, forecast, district_name):
     """คืน (โอกาสฝน %, เป็นพยากรณ์สดหรือไม่)"""
     key = day.strftime("%Y-%m-%d")
     if key in forecast:
         return forecast[key], True
-    return chachoengsao_climatology[day.month], False
+    clim = district_climatology.get(district_name, district_climatology["เมืองฉะเชิงเทรา"])
+    return clim[day.month - 1], False
 
 
 def suggest_dry_day(start, end, forecast, extra_days=5):
@@ -1496,12 +1506,12 @@ def suggest_dry_day(start, end, forecast, extra_days=5):
     return None
 
 
-def rain_window(start, end, forecast):
+def rain_window(start, end, forecast, district_name):
     """โอกาสฝนรายวันตลอดช่วงกิจกรรม [(วันที่, % ฝน, เป็นพยากรณ์สดหรือไม่)] เฉพาะวันที่ยังไม่ผ่านมา"""
     days = []
     d = max(start, today())
     while d <= end:
-        pct, live = rain_for(d, forecast)
+        pct, live = rain_for(d, forecast, district_name)
         days.append((d, pct, live))
         d += timedelta(days=1)
     return days
@@ -1604,7 +1614,7 @@ def get_rice_schedule(sow_date, rice_name, district_name="เมืองฉะ�
         if shift != 0:
             note = f"{fmt_days(shift)} (เริ่มเลื่อนที่: {origins[i]})"
 
-        days = rain_window(n_start, n_end, forecast)
+        days = rain_window(n_start, n_end, forecast, district_name)
         status_text, advice, danger = assess_rain(
             rule, days, n_start, n_end, forecast, district_name
         )
