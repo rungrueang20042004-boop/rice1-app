@@ -70,24 +70,28 @@ h1, h2, h3, h4 {{ color: {GREEN}; }}
 
 /* แถบหัวของแอป */
 .app-header {{
-    background: {GREEN}; border-bottom: 4px solid {GOLD};
-    border-radius: 10px; padding: 1rem 1.25rem; margin-bottom: 1rem;
-    display: flex; align-items: center; justify-content: center; gap: 1.25rem;
+    background: #FFFFFF; border-bottom: 3px solid {GOLD};
+    border-radius: 10px 10px 0 0; padding: 1rem 1.5rem; margin-bottom: 1rem;
+    display: flex; align-items: center; gap: 1.25rem;
 }}
-.app-header img {{ height: 72px; width: auto; flex-shrink: 0; }}
-.app-header .app-header-text {{ text-align: center; }}
-.app-header h1 {{ color: {CREAM}; margin: 0; padding: 0; font-size: 1.9rem; }}
-.app-header p {{ color: {GOLD_LIGHT}; margin: .25rem 0 0; }}
+.app-header img {{ height: 64px; width: auto; flex-shrink: 0; }}
+.app-header .app-header-text {{
+    border-left: 1px solid {GOLD_LIGHT}; padding-left: 1.25rem;
+}}
+.app-header h1 {{ color: {GREEN}; margin: 0; padding: 0; font-size: 1.7rem; line-height: 1.3; }}
+.app-header p {{ color: #6B6B6B; margin: .2rem 0 0; font-size: .95rem; }}
 @media (max-width: 640px) {{
-    .app-header {{ flex-direction: column; gap: .5rem; }}
-    .app-header img {{ height: 56px; }}
-    .app-header h1 {{ font-size: 1.4rem; }}
+    .app-header {{ flex-direction: column; align-items: flex-start; gap: .5rem; }}
+    .app-header .app-header-text {{ border-left: none; padding-left: 0; }}
+    .app-header img {{ height: 48px; }}
+    .app-header h1 {{ font-size: 1.3rem; }}
 }}
 
 /* แท็บ */
 .stTabs [data-baseweb="tab"] {{ color: {TEXT}; }}
 .stTabs [aria-selected="true"] {{ color: {GREEN}; font-weight: 600; }}
-.stTabs [data-baseweb="tab-highlight"] {{ background-color: {GOLD}; }}
+.stTabs [data-baseweb="tab-highlight"] {{ background-color: {GOLD} !important; }}
+.stTabs [aria-selected="true"] p {{ color: {GREEN} !important; }}
 
 /* ปุ่มทั่วไป */
 .stButton > button, .stDownloadButton > button, .stFormSubmitButton > button {{
